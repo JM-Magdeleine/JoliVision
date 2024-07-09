@@ -1,3 +1,17 @@
+"""Primary script for fusing MiniCPMV vision tower
+with Qwen language model for a strong vision-language model.
+TO DO: finish cleaning up
+TO DO: actually document functions
+TO DO: figure out how to adjust for training (and only do it to projector)
+TO DO: weed out what needs to be weeded out
+TO DO: create standalone class for the model
+
+? TO DO: add support for image embedding within text ?
+? TO DO: add support for multi-image ?
+
+(suggestive order to treat said to-do items)
+"""
+# TO DO figure out which import are not used
 import base64
 import inspect
 import io
@@ -12,69 +26,17 @@ from torch import nn
 from PIL import Image
 from transformers import AutoModel, AutoTokenizer
 
-sys.path.insert(0, "/data3/jmarie/MiniCPM-V")
+# TO DO need to remove this line to get rid of local dependencies,
+# but needed for CPMV classes ˇˇˇˇˇˇˇˇˇˇ 
+sys.path.insert(0, "/data3/jmarie/MiniCPM-V") 
 from chat import MiniCPMVChat, img2base64
 
 cpm = MiniCPMVChat('openbmb/MiniCPM-V-2')
 
-# # num = 0
-# # for child in cpm.children():
-# #     print(num)
-# #     print(child)
-# #     num += 1
-
-# # print("------------------ NUM --------------------")
-# # print(num)
-
-# """
-# modules = []
-# def add_hook(model):
-#     def forward_hook_ins(module, input, output):
-#         print(next(module.named_modules()))
-#     model.register_forward_hook(forward_hook_ins)
-# cpm.apply(add_hook)
-# """
-
-# im_64 = img2base64('/data3/jmarie/internvl-flares-train/001.png')
-# msgs = [{'role': 'user', 'content': 'What is in the image?'}]
-# inputs = {"image": im_64, "question": json.dumps(msgs)}
-
-# print("chat")
-# res = cpm.chat(inputs)
-# print("----------- RES -------------")
-# print(res)
-
-# # embeds, hidden_states = cpm.model.model.get_vllm_embedding()
-# # print("---------- HIDDEN STATES ------------")
-# # print(hidden_states)
-# # print(cpm.model.tokenizer)
-# # print(inspect.getsource(cpm.model.model.chat))
-# # print(os.path.abspath(inspect.getfile(cpm.model.model.chat)))
-# # print(cpm.model.__dict__)
-
-# # print(cpm.generate_vllm())
-# # print("-------------- MODULES ---------------")
-# # print(modules)
-
-# # print(cpm.vpm)
-# # print(inspect.getmro(type(cpm)))
-# # for parameter in cpm.llm.lm_head.parameters():
-# #     print(parameter)
-# # print(cpm.llm.lm_head.parameters())
-# # print(cpm.__dir__())
-
-# # for name, module in cpm.named_modules():
-# #     print(name, module)
-# # print(cpm.get_vllm_embedding())
-# # print(type(cpm).__name__)
-# # print(vars(cpm).keys())
-
-
-
+# Qwen imports
 from transformers import AutoModelForCausalLM, AutoTokenizer
 device = "cuda" # the device to load the model onto
 
-# Now you do not need to add "trust_remote_code=True"
 qwen = AutoModelForCausalLM.from_pretrained(
     "Qwen/Qwen2-0.5B-Instruct",
     torch_dtype="auto",
@@ -82,38 +44,18 @@ qwen = AutoModelForCausalLM.from_pretrained(
     attn_implementation="flash_attention_2"
     )
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
-# print(dir(qwen))
-# # Instead of using model.chat(), we directly use model.generate()
-# # But you need to use tokenizer.apply_chat_template() to format your inputs as shown below
-prompt = "Give me a short introduction to large language model."
-messages = [
-    {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": prompt}
-]
 text = tokenizer.apply_chat_template(
     messages,
     tokenize=False,
     add_generation_prompt=True
 )
-model_inputs = tokenizer([text], return_tensors="pt").to(device)
 
-# Directly use generate() and tokenizer.decode() to get the output.
-# Use `max_new_tokens` to control the maximum output length.
-# generated_ids = qwen.generate(
-#     model_inputs.input_ids,
-#     max_new_tokens=512
-# )
-# generated_ids = [
-#     output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-# ]
-
-# response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-# print("-------------- RESPONSE -----------------")
-# print(response)
-
-# print("-------------- QWEN -----------------")
+# Projector definition 
 class CPMQwenProjector(nn.Module):
     def __init__(self, input_size, output_size):
+        # Keep or remove modular sizes ?
+        # Useful to keep if either models ever change
+        # embedding spatial dimensions. Also seems cleaner
         super().__init__()
         self.proj = nn.Sequential(
             nn.Linear(in_features=input_size, out_features=output_size),
@@ -121,12 +63,11 @@ class CPMQwenProjector(nn.Module):
         )
 
         # Xavier init weights
+        # Is this even necessary ???
         modules_gen = self.proj.modules()
         next(modules_gen)
         for layer in modules_gen:
             for parameter in layer.parameters():
-                # print("--------------- PARAMETERS ----------------")
-                # print(parameter)
                 if len(parameter.size()) <= 1:
                     nn.init.normal_(parameter)
                 else:
@@ -136,20 +77,24 @@ class CPMQwenProjector(nn.Module):
         return self.proj(x)
 
 projector = CPMQwenProjector(input_size=2304, output_size=896)
-# for layer in projector.modules():
-#     print(layer)
-# print(sys.path)
 
-
-print("----------------- EMBED TEST ------------------")
+# ESSENTIAL, CORE function to make the fusion work
+# TO DO create a seperate classe ineheriting from both MiniCPMV and Qwen
+# in order to remove dependencies from provided models, their embedding spaces
+# and to make the code cleaner overall
 def get_image_embeds(model, tokenizer, input_str: str, image: str, sampling=True, max_inp_length=2048, **kwargs) -> torch.Tensor:
-    vision_hidden_states=None
+    """Get image embeddings from the image, within the context of the input string
+    """
+    # TO DO remove need to provide model and tokenizer
+    # TO DO is the input_str argument necessary ?
+    vision_hidden_states=None # TO DO find a way to remove this
     
     # format input just like model.chat
     image = img2base64(image)
     image = Image.open(io.BytesIO(base64.b64decode(image))).convert('RGB')
     msgs = [{'role': 'user', 'content': input_str}] 
-    
+
+    # ˇˇˇˇˇˇˇˇˇˇ TO DO Whole section to weed out
     # msgs to prompt
     prompt = ""
     for i, msg in enumerate(msgs):
@@ -197,12 +142,15 @@ def get_image_embeds(model, tokenizer, input_str: str, image: str, sampling=True
     generation_config.update(
         (k, kwargs[k]) for k in generation_config.keys() & kwargs.keys()
     )
+    # End of section to weed out
         
     # do the same as in generate, but stop when image_bound and input_embeds are loaded
     # MAX_INP_LENGTH ?
     # TOKENIZER ?
     # MAX_NEW_TOKENS ?
 
+    # TO DO actually stop when both things are loaded,
+    # ˇˇˇˇˇˇˇˇˇˇ basically weed it all out as well
     data_list = [final_input]
     img_list = [images]
     
@@ -232,7 +180,8 @@ def get_image_embeds(model, tokenizer, input_str: str, image: str, sampling=True
             model_inputs["inputs_embeds"],
             vision_hidden_states,
         ) = model.get_vllm_embedding(model_inputs)
-
+    # End of section to weed out
+    
     # recuperate model_inputs
     image_bound, inputs_embeds = model_inputs["image_bound"], model_inputs["inputs_embeds"]
 
@@ -244,8 +193,11 @@ def get_image_embeds(model, tokenizer, input_str: str, image: str, sampling=True
     # return cut-out image embeds
     return image_embeds
 
-EOT_TOKEN_ID=151644
+EOT_TOKEN_ID=151644 # Why is this even there??
 def embed_mixed_modal(model, cpm_tokenizer, input_str: str, image: str, sampling=True) -> list[int]:
+    """Function to embed mixed modal input using MiniCPMV embedding
+    projected into Qwen embedding space
+    """
     # MiniCPMV tokenization + getting visual tokens
     cpm_image_embeds = get_image_embeds(model, cpm_tokenizer, input_str, image)
     # print("---------------Image embeds ---------------")
