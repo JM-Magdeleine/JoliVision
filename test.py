@@ -1,4 +1,6 @@
+import base64
 import inspect
+import io
 import json
 import os
 import re
@@ -15,32 +17,32 @@ from chat import MiniCPMVChat, img2base64
 
 cpm = MiniCPMVChat('openbmb/MiniCPM-V-2')
 
-# num = 0
-# for child in cpm.children():
-#     print(num)
-#     print(child)
-#     num += 1
+# # num = 0
+# # for child in cpm.children():
+# #     print(num)
+# #     print(child)
+# #     num += 1
 
-# print("------------------ NUM --------------------")
-# print(num)
+# # print("------------------ NUM --------------------")
+# # print(num)
 
-"""
-modules = []
-def add_hook(model):
-    def forward_hook_ins(module, input, output):
-        print(next(module.named_modules()))
-    model.register_forward_hook(forward_hook_ins)
-cpm.apply(add_hook)
-"""
+# """
+# modules = []
+# def add_hook(model):
+#     def forward_hook_ins(module, input, output):
+#         print(next(module.named_modules()))
+#     model.register_forward_hook(forward_hook_ins)
+# cpm.apply(add_hook)
+# """
 
-im_64 = img2base64('/data3/jmarie/internvl-flares-train/001.png')
-msgs = [{'role': 'user', 'content': 'What is in the image?'}]
-inputs = {"image": im_64, "question": json.dumps(msgs)}
+# im_64 = img2base64('/data3/jmarie/internvl-flares-train/001.png')
+# msgs = [{'role': 'user', 'content': 'What is in the image?'}]
+# inputs = {"image": im_64, "question": json.dumps(msgs)}
 
-print("chat")
-res = cpm.chat(inputs)
-print("----------- RES -------------")
-print(res)
+# print("chat")
+# res = cpm.chat(inputs)
+# print("----------- RES -------------")
+# print(res)
 
 # # embeds, hidden_states = cpm.model.model.get_vllm_embedding()
 # # print("---------- HIDDEN STATES ------------")
@@ -110,7 +112,6 @@ model_inputs = tokenizer([text], return_tensors="pt").to(device)
 # print(response)
 
 # print("-------------- QWEN -----------------")
-print(dir(qwen))
 class CPMQwenProjector(nn.Module):
     def __init__(self, input_size, output_size):
         super().__init__()
@@ -124,8 +125,8 @@ class CPMQwenProjector(nn.Module):
         next(modules_gen)
         for layer in modules_gen:
             for parameter in layer.parameters():
-                print("--------------- PARAMETERS ----------------")
-                print(parameter)
+                # print("--------------- PARAMETERS ----------------")
+                # print(parameter)
                 if len(parameter.size()) <= 1:
                     nn.init.normal_(parameter)
                 else:
@@ -134,18 +135,20 @@ class CPMQwenProjector(nn.Module):
     def forward(self, x):
         return self.proj(x)
 
-projector = CPMQwenProjector(input_size=504, output_size=5)
+projector = CPMQwenProjector(input_size=2304, output_size=896)
 # for layer in projector.modules():
 #     print(layer)
 # print(sys.path)
 
 
-
-def get_image_embeds(model, input_str: str, image: str) -> torch.Tensor:
+print("----------------- EMBED TEST ------------------")
+def get_image_embeds(model, tokenizer, input_str: str, image: str, sampling=True, max_inp_length=2048, **kwargs) -> torch.Tensor:
+    vision_hidden_states=None
+    
     # format input just like model.chat
     image = img2base64(image)
-    msgs = [{'role': 'user', 'content': input_str}]
-    msgs = json.loads(msgs)
+    image = Image.open(io.BytesIO(base64.b64decode(image))).convert('RGB')
+    msgs = [{'role': 'user', 'content': input_str}] 
     
     # msgs to prompt
     prompt = ""
@@ -158,8 +161,8 @@ def get_image_embeds(model, input_str: str, image: str) -> torch.Tensor:
                 images = []
             else:
                 assert role == "user", "The role of first msg should be user"
-                if self.config.slice_mode:
-                    images, final_placeholder = self.get_slice_image_placeholder(
+                if model.config.slice_mode:
+                    images, final_placeholder = model.get_slice_image_placeholder(
                         image, tokenizer
                     )
                     content = final_placeholder + "\n" + content
@@ -167,7 +170,7 @@ def get_image_embeds(model, input_str: str, image: str) -> torch.Tensor:
                     images = [image]
                     content = (
                         tokenizer.im_start
-                        + tokenizer.unk_token * self.config.query_num
+                        + tokenizer.unk_token * model.config.query_num
                         + tokenizer.im_end
                         + "\n"
                         + content
@@ -230,22 +233,32 @@ def get_image_embeds(model, input_str: str, image: str) -> torch.Tensor:
             vision_hidden_states,
         ) = model.get_vllm_embedding(model_inputs)
 
-        result = model._decode(model_inputs["inputs_embeds"], tokenizer, **kwargs)
     # recuperate model_inputs
-    image_bound, input_embeds = model_inputs["image_bound"], model_inputs["inputs_embeds"]
+    image_bound, inputs_embeds = model_inputs["image_bound"], model_inputs["inputs_embeds"]
 
     # segment out image embeds
     image_embeds = []
-    image_embeds.append(inputs_embeds[image_bound[0], image_bound[-1]])
+    print(image_bound, image_bound[0][0][0])
+    image_embeds.append(inputs_embeds[0][image_bound[0][0][0]: image_bound[0][-1][-1]])
     
     # return cut-out image embeds
     return image_embeds
 
 EOT_TOKEN_ID=151644
-def tokenize_mixed_modal(input_str: str, image: str) -> List[int]:
+def embed_mixed_modal(model, cpm_tokenizer, input_str: str, image: str, sampling=True) -> list[int]:
     # MiniCPMV tokenization + getting visual tokens
+    cpm_image_embeds = get_image_embeds(model, cpm_tokenizer, input_str, image)
+    # print("---------------Image embeds ---------------")
+    # print(image_embeds, image_embeds[0].size())
+
+    projector = CPMQwenProjector(input_size=2304, output_size=896).to(model.device).bfloat16()
     
-    
+    qwen_image_embeds = []
+    with torch.no_grad():
+        for image_embed in cpm_image_embeds:
+            qwen_image_embeds.append(projector(image_embed))
+    # print("QWEN EMBEDS", qwen_embeds, qwen_embeds[0].size())
+
     # Qwen tokenization
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},
@@ -258,7 +271,26 @@ def tokenize_mixed_modal(input_str: str, image: str) -> List[int]:
         tokenize=False,
         add_generation_prompt=True
     )
-    qwen_tokenized_text_inputs = tokenizer([text], return_tensors="pt").to(device)
+    qwen_text_tokens = tokenizer([text], return_tensors="pt").to(device)
+    print(qwen_text_tokens)
+    print("------------ DECODED IMAGE -------------")
+    # print(tokenizer.batch_decode(qwen.lm_head(qwen_image_embeds[0])))
+    # print(tokenizer.batch_decode(qwe))
+    qwen_text_embeds = qwen.get_input_embeddings()(qwen_text_tokens["input_ids"][0]) # text tokens embedded in a 896-dimensional space
+    # print("QWEN TEXT EMBEDS", qwen_text_embeds[0].unsqueeze(0).size(), qwen_text_embeds[1:].size(), qwen_image_embeds[0].size())
+
+    qwen_embeds = torch.cat((qwen_text_embeds[0].unsqueeze_(0), qwen_image_embeds[0], qwen_text_embeds[1:]))
+    # print(qwen_text_embeds)
+    # print(qwen_image_embeds)
+
+    print("QWEN_EMBEDS", len(qwen_text_embeds), len(qwen_image_embeds[0]))
+    return qwen_embeds
 
 
-tokenize_mixed_modal("[image] Here is the image, [image], show me what this [image] corresponds to", ["/home/jmarie/flares/positive_img/0000.png", "/home/jmarie/flares/positive_img/0001.png", "/home/jmarie/flares/positive_img/0002.png"])
+multimodal_embeds = embed_mixed_modal(cpm.model.model,
+                  cpm.model.tokenizer,
+                  "Describe the text I just gave you",
+                  "/home/jmarie/flares/positive_img/0000.png")
+
+generated_ids = qwen.generate(inputs_embeds=multimodal_embeds.unsqueeze_(0), max_new_tokens=512) # literally generated tokens
+print(tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0])
