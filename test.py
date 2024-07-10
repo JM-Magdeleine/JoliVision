@@ -1,23 +1,27 @@
-"""Primary script for fusing MiniCPMV vision tower
-with Qwen language model for a strong vision-language model.
-TO DO: finish cleaning up
-TO DO: actually document functions
-TO DO: figure out how to adjust for training (and only do it to projector)
+"""Primary script for fusing MiniCPMV vision tower with Qwen language model
+for a strong vision-language model. Possible future developments (over this week or smth)
+include renaming this file, for it to only be used for projector class definition and so on,
+and moving the whole inference/training to a new file contaning the model class definition,
+create scripts for training and for testing in different file.
+This is still very rough, in-early-development work.  
+~ TO DO: finish cleaning up
+# TO DO: actually document functions
+TO DO: complete projector class*
+TO DO: figure out how to adjust for training (and only do it to projector) (goes with above)
 TO DO: weed out what needs to be weeded out
 TO DO: create standalone class for the model
 
 ? TO DO: add support for image embedding within text ?
 ? TO DO: add support for multi-image ?
 
+* add hook for projector class ?
+
 (suggestive order to treat said to-do items)
 """
-# TO DO figure out which import are not used
 import base64
-import inspect
 import io
 import json
 import os
-import re
 import sys
 import torch
 import typing
@@ -25,6 +29,9 @@ import typing
 from torch import nn
 from PIL import Image
 from transformers import AutoModel, AutoTokenizer
+
+# Testing imports
+import inspect
 
 # TO DO need to remove this line to get rid of local dependencies,
 # but needed for CPMV classes ˇˇˇˇˇˇˇˇˇˇ 
@@ -42,8 +49,8 @@ qwen = AutoModelForCausalLM.from_pretrained(
     torch_dtype="auto",
     device_map="auto",
     attn_implementation="flash_attention_2"
-    )
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
+    ).to(device)
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B-Instruct").to(device)
 text = tokenizer.apply_chat_template(
     messages,
     tokenize=False,
@@ -54,13 +61,15 @@ text = tokenizer.apply_chat_template(
 class CPMQwenProjector(nn.Module):
     def __init__(self, input_size, output_size):
         # Keep or remove modular sizes ?
-        # Useful to keep if either models ever change
-        # embedding spatial dimensions. Also seems cleaner
+        # Useful to keep if either models ever change embedding spatial dimensions.
+        # Also seems cleaner
         super().__init__()
         self.proj = nn.Sequential(
             nn.Linear(in_features=input_size, out_features=output_size),
             nn.GELU()
         )
+        # ˇˇˇˇˇˇˇˇˇˇ Rethink whole section: do I want to load it or just initialize it? Depends on instant function of model -> Distinguish between new model and eval/training from checkpoint
+        self.eval()
 
         # Xavier init weights
         # Is this even necessary ???
@@ -74,18 +83,45 @@ class CPMQwenProjector(nn.Module):
                     nn.init.xavier_uniform_(parameter)
 
     def forward(self, x):
+        # maybe revisit if structure made less compact
         return self.proj(x)
+
+    def load_checkpoint(self, path):
+        # model.load_state_dict(torch.load(path))
+        return
+    
+    def save(self, path):
+        # torch.save(self.state_dict(), path)
+        return
 
 projector = CPMQwenProjector(input_size=2304, output_size=896)
 
 # ESSENTIAL, CORE function to make the fusion work
-# TO DO create a seperate classe ineheriting from both MiniCPMV and Qwen
+# TO DO create a seperat classe ineheriting from both MiniCPMV and Qwen
 # in order to remove dependencies from provided models, their embedding spaces
 # and to make the code cleaner overall
 def get_image_embeds(model, tokenizer, input_str: str, image: str, sampling=True, max_inp_length=2048, **kwargs) -> torch.Tensor:
-    """Get image embeddings from the image, within the context of the input string
+    """Get image embeddings from MiniCPMV's vision tower, including slice embeddings
+    and other embeddings necessary for image context. (Maybe link a list of em?)
+    Args:
+        model: model from which vision tower will be used for embedding image
+        tokenizer: tokenizer for vision-language model
+        input_str: input string as provided by user
+        image: ABSOLUTE file path to the image to be embedded. Web images are not supported, must be locally saved image
+        sampling: ???
+        max_input_length: ????
+        kwargs: ??? Used in original MiniCPMV code but idk what use it has here
+    
+    Returns:
+        `torch.Tensor` of shape (1, `len(image_embeds)`, `cpm_embedding_dim`):
+            The image embeddings, with context included (split token embeddings, ...)
     """
-    # TO DO remove need to provide model and tokenizer
+    # is it right to retrieve the embedded tokens within the context of the sentence?
+    # cuz the projector would theoretically have to somehow learn mapping the influence
+    # of the sentence on the CPM embedding, and translate it to smth Qwen understands ?
+    # Is that even the case? Is that even feasible?
+    
+    # TO DO remove need to provide model and tokenizer -> with standalone class
     # TO DO is the input_str argument necessary ?
     vision_hidden_states=None # TO DO find a way to remove this
     
@@ -186,56 +222,55 @@ def get_image_embeds(model, tokenizer, input_str: str, image: str, sampling=True
     image_bound, inputs_embeds = model_inputs["image_bound"], model_inputs["inputs_embeds"]
 
     # segment out image embeds
-    image_embeds = []
-    print(image_bound, image_bound[0][0][0])
-    image_embeds.append(inputs_embeds[0][image_bound[0][0][0]: image_bound[0][-1][-1]])
+    image_embeds = inputs_embeds[0][image_bound[0][0][0]: image_bound[0][-1][-1]]) # for multiple image inference, replace image_embeds with a list to append to + change image_bound indices 
     
     # return cut-out image embeds
     return image_embeds
 
-EOT_TOKEN_ID=151644 # Why is this even there??
 def embed_mixed_modal(model, cpm_tokenizer, input_str: str, image: str, sampling=True) -> list[int]:
-    """Function to embed mixed modal input using MiniCPMV embedding
-    projected into Qwen embedding space
+    """Embed mixed-modal data to the Qwen embedding space. The data is embedded
+    to the cpm multimodal space. The image embeds are picked out and subsequently 
+    projected to the Qwen embedding space using a linear GELU unit.
+    All inputs preparation for embedding is done here (formatting + prompting + tokenization)
+    Args:
+        model: model from which to extract visual embeds (MiniCPMV)
+        cpm_tokenizer: tokenizer for `model`
+        input_str: the complete string input from the user
+        image: image absolute path as image input. Does NOT support web images
+        sampling: idky it's there, used in CPM embedding
+
+    Returns:
+        `torch.Tensor` of shape (1, `len(input_ids)`, `qwen_embedding_space_dims`):
+            Embeddings of the multimodal inputs, with the picture projected embeddings
+            before the qwen text embeds
     """
+    # IS IT RIGHT TO SHIFT THE QWEN EMBEDS ? maybe put padding tokens for embedding and then replace their embeddings with the projected picture's (the model that the text input is shifted and has smth before it)
     # MiniCPMV tokenization + getting visual tokens
     cpm_image_embeds = get_image_embeds(model, cpm_tokenizer, input_str, image)
-    # print("---------------Image embeds ---------------")
-    # print(image_embeds, image_embeds[0].size())
-
-    projector = CPMQwenProjector(input_size=2304, output_size=896).to(model.device).bfloat16()
+    cpm_vision_embedding_dimension = image_embeds.size()[-1] # Change the element accessed for /multi-image 
     
-    qwen_image_embeds = []
+    projector = CPMQwenProjector(input_size=2304, output_size=896).to(model.device).bfloat16() # TO DO moving to device and changing data type incorporated into class __init__ for completing /projector-class
+    
     with torch.no_grad():
-        for image_embed in cpm_image_embeds:
-            qwen_image_embeds.append(projector(image_embed))
-    # print("QWEN EMBEDS", qwen_embeds, qwen_embeds[0].size())
-
+        qwen_image_embeds = projector(image_embed) # change qwen_image_embeds to list for /multi-image
+    
     # Qwen tokenization
+    # figure out how to shift tokens in this block
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": input_str.replace("[image]", "<|end_of_text|>")}
-    ]
-    print(messages)
-    
+        {"role": "user", "content": input_str}
+    ]    
     text = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True
     )
-    qwen_text_tokens = tokenizer([text], return_tensors="pt").to(device)
-    print(qwen_text_tokens)
-    print("------------ DECODED IMAGE -------------")
-    # print(tokenizer.batch_decode(qwen.lm_head(qwen_image_embeds[0])))
-    # print(tokenizer.batch_decode(qwe))
+
+    qwen_text_tokens = tokenizer([text], return_tensors="pt").to(device) # figure out why text is passed as list -> for batch inference perhaps?
     qwen_text_embeds = qwen.get_input_embeddings()(qwen_text_tokens["input_ids"][0]) # text tokens embedded in a 896-dimensional space
-    # print("QWEN TEXT EMBEDS", qwen_text_embeds[0].unsqueeze(0).size(), qwen_text_embeds[1:].size(), qwen_image_embeds[0].size())
 
-    qwen_embeds = torch.cat((qwen_text_embeds[0].unsqueeze_(0), qwen_image_embeds[0], qwen_text_embeds[1:]))
-    # print(qwen_text_embeds)
-    # print(qwen_image_embeds)
+    qwen_embeds = torch.cat((qwen_text_embeds[0].unsqueeze_(0), qwen_image_embeds[0], qwen_text_embeds[1:])) # careful! extracting only one column from a 2-D tensor return a 1-D Tensor (hence unsqueeze)
 
-    print("QWEN_EMBEDS", len(qwen_text_embeds), len(qwen_image_embeds[0]))
     return qwen_embeds
 
 
