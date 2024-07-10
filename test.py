@@ -4,9 +4,8 @@ include renaming this file, for it to only be used for projector class definitio
 and moving the whole inference/training to a new file contaning the model class definition,
 create scripts for training and for testing in different file.
 This is still very rough, in-early-development work.  
-~ TO DO: finish cleaning up
-# TO DO: actually document functions
-TO DO: complete projector class*
+~ TO DO: finish cleaning up, add type safety and work on edge cases for written functions
+~ TO DO: complete projector class*
 TO DO: figure out how to adjust for training (and only do it to projector) (goes with above)
 TO DO: weed out what needs to be weeded out
 TO DO: create standalone class for the model
@@ -14,7 +13,7 @@ TO DO: create standalone class for the model
 ? TO DO: add support for image embedding within text ?
 ? TO DO: add support for multi-image ?
 
-* add hook for projector class ?
+* add hooks for projector class ?
 
 (suggestive order to treat said to-do items)
 """
@@ -57,31 +56,28 @@ text = tokenizer.apply_chat_template(
     add_generation_prompt=True
 )
 
-# Projector definition 
+# Projector definition
+def init_weights(module):
+    if type(module) == nn.Linear: # Careful, this is assuming Projector is only linear
+        nn.init.xavier_normal_(module.weight.data)
+        module.bias.data.fill_(0)
+    return
+
 class CPMQwenProjector(nn.Module):
+    """Projector class for CPM vision embeddings to Qwen text embeddings projection.
+    Default mode is initialization with random weights
+    """
     def __init__(self, input_size, output_size):
-        # Keep or remove modular sizes ?
-        # Useful to keep if either models ever change embedding spatial dimensions.
-        # Also seems cleaner
+        # Keep or remove modular sizes ? -> Keep, in case embedding spaces change (unlikely but you never know)
         super().__init__()
         self.proj = nn.Sequential(
             nn.Linear(in_features=input_size, out_features=output_size),
             nn.GELU()
         )
-        # ˇˇˇˇˇˇˇˇˇˇ Rethink whole section: do I want to load it or just initialize it? Depends on instant function of model -> Distinguish between new model and eval/training from checkpoint
+        # ˇˇˇˇˇˇˇˇˇˇ Rethink whole section: do I want to load it or just initialize it? Depends on instant function of model -> Distinguish between new model and eval/training from checkpoint -> Randomly initialized mode will be the default, and load custom model within the training/inference script if necessary
         self.eval()
-
-        # Xavier init weights
-        # Is this even necessary ???
-        modules_gen = self.proj.modules()
-        next(modules_gen)
-        for layer in modules_gen:
-            for parameter in layer.parameters():
-                if len(parameter.size()) <= 1:
-                    nn.init.normal_(parameter)
-                else:
-                    nn.init.xavier_uniform_(parameter)
-
+        self.apply(init_weights)
+        
     def forward(self, x):
         # maybe revisit if structure made less compact
         return self.proj(x)
