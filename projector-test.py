@@ -33,7 +33,7 @@ sys.path.insert(0, "/data3/jmarie/MiniCPM-V")
 from chat import MiniCPMVChat, img2base64
 
 cpm = MiniCPMVChat('openbmb/MiniCPM-V-2')
-
+print(os.path.abspath(inspect.getfile(type(cpm.model.model))))
 # Qwen imports
 from transformers import AutoModelForCausalLM, AutoTokenizer
 device = "cuda" # the device to load the model onto
@@ -43,18 +43,13 @@ qwen = AutoModelForCausalLM.from_pretrained(
     torch_dtype="auto",
     device_map="auto",
     attn_implementation="flash_attention_2"
-    ).to(device)
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B-Instruct").to(device)
-text = tokenizer.apply_chat_template(
-    messages,
-    tokenize=False,
-    add_generation_prompt=True
-)
+    )
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
 
 # Projector definition
 def init_weights(module):
     # Initialize all weights assuming the NN only has linear layers
-    if type(module) == nn.Linear:
+    if isinstance(module, nn.Linear):
         nn.init.xavier_normal_(module.weight.data)
         module.bias.data.fill_(0)
     return
@@ -96,9 +91,9 @@ projector = CPMQwenProjector(input_size=2304, output_size=896)
 def get_image_embeds(model,
                      tokenizer,
                      input_str: str,
-                     image: str
-                     max_inp_length: Optional[int]=2048,
-                     **kwargs: Optional) -> torch.Tensor:
+                     image: str,
+                     max_inp_length: int=2048,
+                     **kwargs) -> torch.Tensor:
     """Get image embeddings from MiniCPMV's vision tower, including slice embeddings
     and other embeddings necessary for image context. (Maybe link a list of em?)
     Args:
@@ -211,11 +206,11 @@ def get_image_embeds(model,
     
     # Recuperate embedded model_inputs, segment out image embeds
     image_bound, inputs_embeds = model_inputs["image_bound"], model_inputs["inputs_embeds"]
-    image_embeds = inputs_embeds[0][image_bound[0][0][0]: image_bound[0][-1][-1]]) # for multiple image inference, replace image_embeds with a list to append to + change image_bound indices 
+    image_embeds = inputs_embeds[0][image_bound[0][0][0]: image_bound[0][-1][-1]] # for multiple image inference, replace image_embeds with a list to append to + change image_bound indices 
     
     return image_embeds
 
-def embed_mixed_modal(model,
+def embed_mixed_modal(cpm_model,
                       cpm_tokenizer,
                       input_str: str,
                       image: str,
@@ -238,20 +233,20 @@ def embed_mixed_modal(model,
     """
     # Maybe shift Qwen inputs prior to embedding? Would help 
     # MiniCPMV tokenization + getting visual tokens
-    cpm_image_embeds = get_image_embeds(model, cpm_tokenizer, input_str, image)
-    cpm_vision_embedding_dimension = image_embeds.size()[-1] # Change the element accessed for /multi-image 
+    cpm_image_embeds = get_image_embeds(cpm_model, cpm_tokenizer, input_str, image)
+    cpm_vision_embedding_dimension = cpm_image_embeds.size()[-1] # Change the element accessed for /multi-image 
     
     projector = CPMQwenProjector(input_size=2304, output_size=896).to(model.device).bfloat16() # TO DO moving to device and changing data type incorporated into class __init__ for completing /projector-class
     
     with torch.no_grad():
-        qwen_image_embeds = projector(image_embed) # change qwen_image_embeds to list for /multi-image
+        qwen_image_embeds = projector(cpm_image_embeds) # change qwen_image_embeds to list for /multi-image
     
     # Qwen tokenization
     # figure out how to shift tokens in this block
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": input_str}
-    ]    
+    ]
     text = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
@@ -272,3 +267,5 @@ multimodal_embeds = embed_mixed_modal(cpm.model.model,
 
 generated_ids = qwen.generate(inputs_embeds=multimodal_embeds.unsqueeze_(0), max_new_tokens=512) # literally generated tokens
 print(tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0])
+print(type(cpm).__mro__)
+print(type(qwen).__mro__)
