@@ -236,7 +236,7 @@ def embed_mixed_modal(cpm_model,
     cpm_image_embeds = get_image_embeds(cpm_model, cpm_tokenizer, input_str, image)
     cpm_vision_embedding_dimension = cpm_image_embeds.size()[-1] # Change the element accessed for /multi-image 
     
-    projector = CPMQwenProjector(input_size=2304, output_size=896).to(model.device).bfloat16() # TO DO moving to device and changing data type incorporated into class __init__ for completing /projector-class
+    projector = CPMQwenProjector(input_size=2304, output_size=896).to(qwen.device).bfloat16() # TO DO moving to device and changing data type incorporated into class __init__ for completing /projector-class # fixfixfixfixfixfixfix
     
     with torch.no_grad():
         qwen_image_embeds = projector(cpm_image_embeds) # change qwen_image_embeds to list for /multi-image
@@ -255,10 +255,22 @@ def embed_mixed_modal(cpm_model,
 
     qwen_text_tokens = tokenizer([text], return_tensors="pt").to(device) # figure out why text is passed as list -> for batch inference perhaps?
     qwen_text_embeds = qwen.get_input_embeddings()(qwen_text_tokens["input_ids"][0]) # text tokens embedded in a 896-dimensional space
-    qwen_embeds = torch.cat((qwen_text_embeds[0].unsqueeze_(0), qwen_image_embeds[0], qwen_text_embeds[1:])) # Unsqueeze to match dimensions
+    qwen_embeds = torch.cat((qwen_text_embeds[0].unsqueeze_(0), qwen_image_embeds[0].unsqueeze(0), qwen_text_embeds[1:])) # Unsqueeze to match dimensions
 
     return qwen_embeds
 
+
+def generate(mm_model, lm_model, input_str, input_img):
+    mm_embeds = embed_mixed_modal(mm_model.model.model,
+                                  mm_model.model.tokenizer,
+                                  input_str,
+                                  input_img)
+
+    generated_ids = qwen.generate(inputs_embeds=multimodal_embeds.unsqueeze_(0),
+                                  max_new_tokens=512)
+    generated_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    return generated_text
+    
 # Example
 multimodal_embeds = embed_mixed_modal(cpm.model.model,
                                       cpm.model.tokenizer,
@@ -267,5 +279,27 @@ multimodal_embeds = embed_mixed_modal(cpm.model.model,
 
 generated_ids = qwen.generate(inputs_embeds=multimodal_embeds.unsqueeze_(0), max_new_tokens=512) # literally generated tokens
 print(tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0])
-print(type(cpm).__mro__)
-print(type(qwen).__mro__)
+print(dir(qwen))
+print("\n\n---------------------------------------------------------\n\n")
+print(dir(cpm))
+
+
+def projector_training_mode(mm_model, lm_model, projector):
+    # Freeze multimodal model # Change this to vision tower when it's all better
+    mm_model.eval()
+    for parameter in mm_model.parameters:
+        parameter.requires_grad = False
+
+    # Freeze language model
+    lm_model.eval()
+    for parameter in lm_model.parameters():
+        parameter.requires_grad = False
+    
+    projector.train()
+
+def train_projector(mm_model, lm_model, projector, dataset):
+    projector_training_mode(mm_model, lm_model, projector)
+
+    optimizer.zero_grad()
+
+    outputs = 
