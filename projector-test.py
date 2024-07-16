@@ -22,7 +22,7 @@ import typing
 
 from torch import nn
 from PIL import Image
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 # Testing imports
 import inspect
@@ -33,9 +33,8 @@ sys.path.insert(0, "/data3/jmarie/MiniCPM-V")
 from chat import MiniCPMVChat, img2base64
 
 cpm = MiniCPMVChat('openbmb/MiniCPM-V-2')
-print(os.path.abspath(inspect.getfile(type(cpm.model.model))))
-# Qwen imports
-from transformers import AutoModelForCausalLM, AutoTokenizer
+# print(os.path.abspath(inspect.getfile(type(cpm.model.model))))
+# TO DO: remove ?
 device = "cuda" # the device to load the model onto
 
 qwen = AutoModelForCausalLM.from_pretrained(
@@ -47,7 +46,7 @@ qwen = AutoModelForCausalLM.from_pretrained(
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
 
 # Projector definition
-def init_weights(module):
+def init_projector_weights(module):
     # Initialize all weights assuming the NN only has linear layers
     if isinstance(module, nn.Linear):
         nn.init.xavier_normal_(module.weight.data)
@@ -64,9 +63,9 @@ class CPMQwenProjector(nn.Module):
             nn.Linear(in_features=input_size, out_features=output_size),
             nn.GELU()
         )
-        # Randomly initialized mode will be the default, and load custom model within the training/inference script if necessary
+        self.apply(init_projector_weights)
         self.eval()
-        self.apply(init_weights)
+        
         return
         
     def forward(self, x):
@@ -76,29 +75,31 @@ class CPMQwenProjector(nn.Module):
 
     def load_projector_checkpoint(self, path):
         model.load_state_dict(torch.load(path))
+
         return
     
     def save_projector(self, path):
         torch.save(self.state_dict(), path)
+
         return
 
-projector = CPMQwenProjector(input_size=2304, output_size=896)
-
+projector = CPMQwenProjector(input_size=2304, output_size=896).to(qwen.device).bfloat16() # TO DO moving to device and changing data type incorporated into class __init__ for completing /projector-class # fixfixfixfixfixfixfix
+    
 # ESSENTIAL, CORE function to make the fusion work
 # TO DO create a seperate class inheriting from both MiniCPMV and Qwen
 # in order to remove dependencies from provided models, their embedding spaces
 # and to make the code cleaner overall
-def get_image_embeds(model,
-                     tokenizer,
-                     input_str: str,
-                     image: str,
-                     max_inp_length: int=2048,
-                     **kwargs) -> torch.Tensor:
+def embed_image(mm_model,
+                mm_tokenizer,
+                input_str: str,
+                image: str,
+                max_inp_length: int=2048,
+                **kwargs) -> torch.Tensor:
     """Get image embeddings from MiniCPMV's vision tower, including slice embeddings
     and other embeddings necessary for image context. (Maybe link a list of em?)
     Args:
-        model: model from which vision tower will be used for embedding image
-        tokenizer: tokenizer for vision-language model
+        mm_model: multimodal model which will be used for embedding image
+        mm_tokenizer: multimodal model's tokenizer
         input_str: input string as provided by user
         image: ABSOLUTE file path to the image to be embedded. Web images are not supported, must be locally saved image
         max_input_length: ????
@@ -111,7 +112,9 @@ def get_image_embeds(model,
     # Integrate this function to standalone model class
     # Rethink using embeddings within the context of the sentence (future future)
     # (can it learn the influence of the position of the image in the sentence?)
-    
+
+    model = mm_model
+    tokenizer = mm_tokenizer
     vision_hidden_states=None # Necessary?
     sampling = True # Review use of sampling
     
@@ -210,8 +213,11 @@ def get_image_embeds(model,
     
     return image_embeds
 
-def embed_mixed_modal(cpm_model,
-                      cpm_tokenizer,
+def embed_mixed_modal(mm_model,
+                      mm_tokenizer,
+                      lm_model,
+                      lm_tokenizer,
+                      projector,
                       input_str: str,
                       image: str,
                       sampling=True) -> list[int]:
@@ -220,8 +226,11 @@ def embed_mixed_modal(cpm_model,
     projected to the Qwen embedding space using a linear GELU unit.
     All inputs preparation for embedding is done here (formatting + prompting + tokenization)
     Args:
-        model: model from which to extract visual embeds (MiniCPMV)
-        cpm_tokenizer: tokenizer for `model`
+        mm_model: model from which to extract visual embeds (MiniCPMV)
+        mm_tokenizer: tokenizer for multimodal model
+        lm_model: language model used for generation
+        lm_tokenizer: tokenizer for said language model
+        projector: projector layer used for translation mm embeds to lm embeds
         input_str: the complete string input from the user
         image: image absolute path as image input. Does NOT support web images
         sampling: idky, it's there, and it's used in CPM embedding
@@ -233,13 +242,11 @@ def embed_mixed_modal(cpm_model,
     """
     # Maybe shift Qwen inputs prior to embedding? Would help 
     # MiniCPMV tokenization + getting visual tokens
-    cpm_image_embeds = get_image_embeds(cpm_model, cpm_tokenizer, input_str, image)
-    cpm_vision_embedding_dimension = cpm_image_embeds.size()[-1] # Change the element accessed for /multi-image 
-    
-    projector = CPMQwenProjector(input_size=2304, output_size=896).to(qwen.device).bfloat16() # TO DO moving to device and changing data type incorporated into class __init__ for completing /projector-class # fixfixfixfixfixfixfix
+    mm_image_embeds = embed_image(mm_model, mm_tokenizer, input_str, image)
+    mm_vision_embedding_dimension = mm_image_embeds.size()[-1] # Change the element accessed for /multi-image 
     
     with torch.no_grad():
-        qwen_image_embeds = projector(cpm_image_embeds) # change qwen_image_embeds to list for /multi-image
+        lm_image_embeds = projector(mm_image_embeds) # change qwen_image_embeds to list for /multi-image
     
     # Qwen tokenization
     # figure out how to shift tokens in this block
@@ -247,38 +254,50 @@ def embed_mixed_modal(cpm_model,
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": input_str}
     ]
-    text = tokenizer.apply_chat_template(
+    text = lm_tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True
     )
 
-    qwen_text_tokens = tokenizer([text], return_tensors="pt").to(device) # figure out why text is passed as list -> for batch inference perhaps?
-    qwen_text_embeds = qwen.get_input_embeddings()(qwen_text_tokens["input_ids"][0]) # text tokens embedded in a 896-dimensional space
-    qwen_embeds = torch.cat((qwen_text_embeds[0].unsqueeze_(0), qwen_image_embeds[0].unsqueeze(0), qwen_text_embeds[1:])) # Unsqueeze to match dimensions
+    lm_text_tokens = lm_tokenizer([text], return_tensors="pt").to(device) # figure out why text is passed as list -> for batch inference perhaps?
+    lm_text_embeds = lm_model.get_input_embeddings()(lm_text_tokens["input_ids"][0]) # text tokens embedded in a 896-dimensional space
+    lm_embeds = torch.cat((lm_text_embeds[0].unsqueeze_(0), lm_image_embeds[0].unsqueeze(0), lm_text_embeds[1:])) # Unsqueeze to match dimensions
 
-    return qwen_embeds
+    return lm_embeds
 
 
-def generate(mm_model, lm_model, input_str, input_img):
-    mm_embeds = embed_mixed_modal(mm_model.model.model,
+def generate(mm_model, lm_model, lm_tokenizer, projector, input_str, input_img):
+    mm_embeds = embed_mixed_modal(mm_model.model.model,                                  
                                   mm_model.model.tokenizer,
+                                  lm_model,
+                                  lm_tokenizer,
+                                  projector,
                                   input_str,
                                   input_img)
-
-    generated_ids = qwen.generate(inputs_embeds=multimodal_embeds.unsqueeze_(0),
-                                  max_new_tokens=512)
-    generated_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-    return generated_text
     
+    generated_ids = lm_model.model(inputs_embeds=mm_embeds.unsqueeze_(0))
+    print(generated_ids)
+    # generated_text = lm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+    return generated_text
+
 # Example
+print(generate(cpm,
+               qwen,
+               tokenizer,
+               projector,
+               "Describe the text I just gave you",
+               "/home/jmarie/flares/positive_img/0000.png"
+               ))
+
+"""Testing before the generate function was written
 multimodal_embeds = embed_mixed_modal(cpm.model.model,
                                       cpm.model.tokenizer,
-                                      "Describe the text I just gave you",
-                                      "/home/jmarie/flares/positive_img/0000.png")
-
+                                      
 generated_ids = qwen.generate(inputs_embeds=multimodal_embeds.unsqueeze_(0), max_new_tokens=512) # literally generated tokens
 print(tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0])
+"""
 print(dir(qwen))
 print("\n\n---------------------------------------------------------\n\n")
 print(dir(cpm))
@@ -294,12 +313,20 @@ def projector_training_mode(mm_model, lm_model, projector):
     lm_model.eval()
     for parameter in lm_model.parameters():
         parameter.requires_grad = False
-    
+
     projector.train()
+    for parameter in projector.parameters():
+        parameter.requires_grad = True
+
+    return
 
 def train_projector(mm_model, lm_model, projector, dataset):
     projector_training_mode(mm_model, lm_model, projector)
 
     optimizer.zero_grad()
 
-    outputs = 
+    input_embeds = embed_mixed_model(mm_model.model, mm_model.tokenizer, input_str, image)
+    
+    outputs = lm_model.model(input_embeds)
+
+    return
