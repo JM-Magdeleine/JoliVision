@@ -22,6 +22,7 @@ import typing
 
 from torch import nn
 from PIL import Image
+from torch.nn.modules.loss import _Loss
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 # Testing imports
@@ -280,7 +281,7 @@ def generate(mm_model, lm_model, lm_tokenizer, projector, input_str, input_img):
     print(generated_ids)
     # generated_text = lm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
-    return generated_text
+    return generated_ids
 
 # Example
 print(generate(cpm,
@@ -320,13 +321,37 @@ def projector_training_mode(mm_model, lm_model, projector):
 
     return
 
-def train_projector(mm_model, lm_model, projector, dataset):
+# CLASS NOT FINISHED
+class CLIPLoss(_Loss):
+    def __init__():
+        super().__init__()
+
+    def forward(self, input1: Tensor, input2: Tensor, target:Tensor) -> Tensor:
+        return # F.l1loss
+
+def train_projector(mm_model, lm_model, projector, data_path):
+    """For now, dummy training instance. TO DO: add support for training args
+    for more fine-tuned fine-tuning
+    TO DO: fuse into model class
+    """
+    batch_size = 32
+    train, test = load_dataset(dataset)
+    loss_fn = # Most important aspect
     projector_training_mode(mm_model, lm_model, projector)
 
-    optimizer.zero_grad()
+    optimizer = torch.optim.AdamW(projector.parameters()) # Hyperparameters TBD w/ trianing args
+    lr_scheduler = CosineAnnealingLR(optimizer=optimizer, T_max=50) # Same here
 
-    input_embeds = embed_mixed_model(mm_model.model, mm_model.tokenizer, input_str, image)
-    
-    outputs = lm_model.model(input_embeds)
+
+    while len(train_dataset) != 0:
+        for input, target in dataset:
+            optimizer.zero_grad()
+            output  = lm_model(embed_mixed_modal(mm_model.model, mm_model.tokenizer, input_str, image))
+            loss = loss_fn(output, target)
+            loss.backward()
+            optimizer.step()
 
     return
+
+def training_step(mm_model, lm_model, projector):
+    
