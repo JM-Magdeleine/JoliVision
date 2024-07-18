@@ -1,3 +1,4 @@
+
 """Primary script for fusing MiniCPMV vision tower with Qwen language model
 for a strong vision-language model. Future ideas include only using this file
 for the projector class, and moving inference/training to a new file
@@ -5,7 +6,7 @@ for the the model class. The same applies for inference, training and testing sc
 This is still very rough work.  
 ~ TO DO: implement training capabilities, work on edge cases
 TO DO: weed out what needs to be weeded out
-TO DO: create standalone class for the complete MiniCPMV-Qwen model
+TO DO: create custom fusion class
 
 ? FEATURE: add support for image embedding within text ?
 ? FEATURE: add support for multi-image ?
@@ -18,11 +19,13 @@ import json
 import os
 import sys
 import torch
+import torch.nn.functional as F
 import typing
 
 from torch import nn
 from PIL import Image
 from torch.nn.modules.loss import _Loss
+from torch.nn.function import cross_entropy
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 # Testing imports
@@ -47,32 +50,28 @@ qwen = AutoModelForCausalLM.from_pretrained(
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
 
 # Projector definition
-def init_projector_weights(module):
-    # Initialize all weights assuming the NN only has linear layers
-    if isinstance(module, nn.Linear):
-        nn.init.xavier_normal_(module.weight.data)
-        module.bias.data.fill_(0)
-    return
-
+# Integrate to custom model class
 class CPMQwenProjector(nn.Module):
     """Projector class for CPM vision embeddings to Qwen text embeddings projection.
     Default mode is initialization with random weights
     """
     def __init__(self, input_size: int, output_size: int):
         super().__init__()
-        self.proj = nn.Sequential(
-            nn.Linear(in_features=input_size, out_features=output_size),
-            nn.GELU()
-        )
+        self.linear = nn.Linear(in_features=input_size, out_features=output_size),
+        self.gelu = nn.GELU()
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        
         self.apply(init_projector_weights)
         self.eval()
         
         return
         
     def forward(self, x):
-        # Revisit if Sequential is ditched
-        # Differentiate between torch.inference_mode and torch.train()
-        return self.proj(x)
+        batch_size = x.size(dim=0)
+        projected_image = self.gelu(torch.stack([self.linear for idx in batch_size])(x))
+        projection_len = torch.norm(projected_image, dim=-1, keepdim=True)
+        
+        return projected_image/projection_len
 
     def load_projector_checkpoint(self, path):
         model.load_state_dict(torch.load(path))
@@ -83,13 +82,18 @@ class CPMQwenProjector(nn.Module):
         torch.save(self.state_dict(), path)
 
         return
+    
+    def init_projector_weights(self):
+        # Initialize all weights assuming the NN only has linear layers
+        if isinstance(self.module, nn.Linear):
+            nn.init.xavier_normal_(self.module.weight.data)
+            self.module.bias.data.fill_(0)
+        return
 
 projector = CPMQwenProjector(input_size=2304, output_size=896).to(qwen.device).bfloat16() # TO DO moving to device and changing data type incorporated into class __init__ for completing /projector-class # fixfixfixfixfixfixfix
     
-# ESSENTIAL, CORE function to make the fusion work
-# TO DO create a seperate class inheriting from both MiniCPMV and Qwen
-# in order to remove dependencies from provided models, their embedding spaces
-# and to make the code cleaner overall
+
+# Integrate to custom model class
 def embed_image(mm_model,
                 mm_tokenizer,
                 input_str: str,
@@ -214,6 +218,7 @@ def embed_image(mm_model,
     
     return image_embeds
 
+# Integrate to custommodel class
 def embed_mixed_modal(mm_model,
                       mm_tokenizer,
                       lm_model,
@@ -245,7 +250,8 @@ def embed_mixed_modal(mm_model,
     # MiniCPMV tokenization + getting visual tokens
     mm_image_embeds = embed_image(mm_model, mm_tokenizer, input_str, image)
     mm_vision_embedding_dimension = mm_image_embeds.size()[-1] # Change the element accessed for /multi-image 
-    
+
+    # torch.no_grad really ?
     with torch.no_grad():
         lm_image_embeds = projector(mm_image_embeds) # change qwen_image_embeds to list for /multi-image
     
@@ -261,13 +267,14 @@ def embed_mixed_modal(mm_model,
         add_generation_prompt=True
     )
 
-    lm_text_tokens = lm_tokenizer([text], return_tensors="pt").to(device) # figure out why text is passed as list -> for batch inference perhaps?
+    lm_text_tokens = lm_tokenizer([text], return_tensors="pt").to(device)
     lm_text_embeds = lm_model.get_input_embeddings()(lm_text_tokens["input_ids"][0]) # text tokens embedded in a 896-dimensional space
+    # CHECK FOR NORMALIZATION OF VECTORS
     lm_embeds = torch.cat((lm_text_embeds[0].unsqueeze_(0), lm_image_embeds[0].unsqueeze(0), lm_text_embeds[1:])) # Unsqueeze to match dimensions
 
     return lm_embeds
 
-
+# Integrate to custom model class
 def generate(mm_model, lm_model, lm_tokenizer, projector, input_str, input_img):
     mm_embeds = embed_mixed_modal(mm_model.model.model,                                  
                                   mm_model.model.tokenizer,
@@ -303,7 +310,7 @@ print(dir(qwen))
 print("\n\n---------------------------------------------------------\n\n")
 print(dir(cpm))
 
-
+# Intergate to cusom model class
 def projector_training_mode(mm_model, lm_model, projector):
     # Freeze multimodal model # Change this to vision tower when it's all better
     mm_model.eval()
@@ -321,37 +328,55 @@ def projector_training_mode(mm_model, lm_model, projector):
 
     return
 
-# CLASS NOT FINISHED
+# Write documentation
 class CLIPLoss(_Loss):
     def __init__():
         super().__init__()
+        self.device = "cuda" if torch.cuda.is_visible() else "cpu"
 
-    def forward(self, input1: Tensor, input2: Tensor, target:Tensor) -> Tensor:
-        return # F.l1loss
+    def forward(self, text_embeds: torch.Tensor, image_embeds: torch.Tensor) -> torch.Tensor:
+      logits = text_embeds @ image_embeds.T
+      n = logits.shape[1]
+      labels = torch.arange(n)
+      logits = logits.to(self.device)
 
+      # Figure out why the lgits.transpose, cf
+      # https://github.com/RustamyF/clip-multimodal-ml/blob/main/src/model_loss.py
+      # and
+      # https://towardsdatascience.com/clip-model-and-the-importance-of-multimodal-embeddings-1c8f6b13bf72
+      images_loss = cross_entropy(logits.transpose(0, 1), labels, reduction="mean")
+      texts_loss = cross_entropy(logits, labels, reduction="mean")
+
+      return = (image_loss + text_loss) / 2
+
+# Integrate to custom model class
 def train_projector(mm_model, lm_model, projector, data_path):
     """For now, dummy training instance. TO DO: add support for training args
     for more fine-tuned fine-tuning
     TO DO: fuse into model class
     """
+    # TEST FOR NORM OF TEXT EMBEDDING
     batch_size = 32
     train, test = load_dataset(dataset)
     loss_fn = # Most important aspect
     projector_training_mode(mm_model, lm_model, projector)
 
-    optimizer = torch.optim.AdamW(projector.parameters()) # Hyperparameters TBD w/ trianing args
+    optimizer = torch.optim.AdamW(projector.parameters()) # Hyperparameters TBP w/ trianing args
     lr_scheduler = CosineAnnealingLR(optimizer=optimizer, T_max=50) # Same here
 
 
     while len(train_dataset) != 0:
-        for input, target in dataset:
+        for batch in dataset:
             optimizer.zero_grad()
+
             output  = lm_model(embed_mixed_modal(mm_model.model, mm_model.tokenizer, input_str, image))
+            
             loss = loss_fn(output, target)
             loss.backward()
             optimizer.step()
 
     return
 
+# integrate to custom model class
 def training_step(mm_model, lm_model, projector):
-    
+    return
