@@ -29,7 +29,6 @@ import json
 import os
 import sys
 import torch
-import torch.nn.functional as F
 import typing
 
 from torch import nn
@@ -47,8 +46,6 @@ sys.path.insert(0, "/data3/jmarie/MiniCPM-V")
 from chat import MiniCPMVChat, img2base64
 
 cpm = MiniCPMVChat('openbmb/MiniCPM-V-2')
-# print(os.path.abspath(inspect.getfile(type(cpm.model.model))))
-# TO DO: remove ?
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 qwen = AutoModelForCausalLM.from_pretrained(
@@ -56,8 +53,8 @@ qwen = AutoModelForCausalLM.from_pretrained(
     torch_dtype="auto",
     device_map="auto",
     attn_implementation="flash_attention_2"
-    ).to(device)
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B-Instruct").to(device)
+    )
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
 
 # Projector definition
 # Integrate to custom model class
@@ -309,7 +306,6 @@ def generate(mm_model, lm_model, lm_tokenizer, projector, text: str, image: str)
     )
 
     generated_ids = lm_model.model(inputs_embeds=mm_embeds.unsqueeze_(0))
-    print(generated_ids)
     # generated_text = lm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
     return generated_ids
@@ -351,19 +347,19 @@ class CLIPLoss(_Loss):
         self.device = device
 
     def forward(self, text_embeds: torch.Tensor, image_embeds: torch.Tensor) -> torch.Tensor:
-      logits = text_embeds @ image_embeds.T
-      n = logits.shape[1]
-      labels = torch.arange(n)
-      logits = logits.to(self.device)
+        logits = text_embeds @ image_embeds.T
+        n = logits.shape[1]
+        labels = torch.arange(n).to(self.device)
+        logits = logits.to(self.device)
 
-      # Figure out why the logits.transpose, cf
-      # https://github.com/RustamyF/clip-multimodal-ml/blob/main/src/model_loss.py
-      # and
-      # https://towardsdatascience.com/clip-model-and-the-importance-of-multimodal-embeddings-1c8f6b13bf72
-      images_loss = cross_entropy(logits.transpose(0, 1), labels, reduction="mean")
-      texts_loss = cross_entropy(logits, labels, reduction="mean")
+        # Cf
+        # https://github.com/openai/CLIP/blob/main/clip/model.py
+        # and
+        # https://towardsdatascience.com/clip-model-and-the-importance-of-multimodal-embeddings-1c8f6b13bf72
+        images_loss = cross_entropy(logits.transpose(0, 1), labels, reduction="mean")
+        texts_loss = cross_entropy(logits, labels, reduction="mean")
 
-      return (images_loss + texts_loss) / 2
+        return (images_loss + texts_loss) / 2
 
 # Integrate to custom model class
 def train_projector(mm_model, lm_model, lm_tokenizer, projector):
@@ -397,14 +393,16 @@ def train_projector(mm_model, lm_model, lm_tokenizer, projector):
         image=image
         )
 
+    print(tokenizer)
+    print(text_embeds.size(), image_embeds.size())
     loss = loss_fn(text_embeds, image_embeds)
     loss.backward()
     optimizer.step()
-
-    projector.save("/data3/jmarie/JoliVision/test-checkpoint")
+    
+    projector.save("/data3/jmarie/JoliVision/test-checkpoint/")
 
     return
 
-print(cpm.model.model.__dict__.keys())
-print(inspect.getmro(type(cpm.model.model)))
+# print(cpm.model.model.__dict__.keys())
+# print(inspect.getmro(type(cpm.model.model)))
 train_projector(cpm, qwen, tokenizer, projector)
