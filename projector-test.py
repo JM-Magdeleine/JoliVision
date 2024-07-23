@@ -33,7 +33,6 @@ import typing
 
 from torch import nn
 from PIL import Image
-from torch.nn.modules.loss import _Loss
 from torch.nn.functional import cross_entropy
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
@@ -305,21 +304,23 @@ def generate(mm_model, lm_model, lm_tokenizer, projector, text: str, image: str)
         image
     )
 
-    generated_ids = lm_model.model(inputs_embeds=mm_embeds.unsqueeze_(0))
+    generated_ids = lm_model(inputs_embeds=mm_embeds.unsqueeze_(0))
     # generated_text = lm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    print("---------------- GENERATED IDS ----------------")
+    print(generated_ids.keys())
 
     return generated_ids
 
 # Example
-print(generate(
+"""print(generate(
         cpm,
         qwen,
         tokenizer,
         projector,
-        "Describe the text I just gave you",
+        "Describe the image I just gave you",
         "/home/jmarie/flares/positive_img/0000.png"
     )
-)
+)"""
 
 # Intergate to cusom model class
 def projector_training_mode(mm_model, lm_model, projector):
@@ -340,27 +341,6 @@ def projector_training_mode(mm_model, lm_model, projector):
 
     return
 
-# Do the documentation of class
-class CLIPLoss(_Loss):
-    def __init__(self):
-        super().__init__()
-        self.device = device
-
-    def forward(self, text_embeds: torch.Tensor, image_embeds: torch.Tensor) -> torch.Tensor:
-        logits = text_embeds @ image_embeds.T
-        n = logits.shape[1]
-        labels = torch.arange(n).to(self.device)
-        logits = logits.to(self.device)
-
-        # Cf
-        # https://github.com/openai/CLIP/blob/main/clip/model.py
-        # and
-        # https://towardsdatascience.com/clip-model-and-the-importance-of-multimodal-embeddings-1c8f6b13bf72
-        images_loss = cross_entropy(logits.transpose(0, 1), labels, reduction="mean")
-        texts_loss = cross_entropy(logits, labels, reduction="mean")
-
-        return (images_loss + texts_loss) / 2
-
 # Integrate to custom model class
 def train_projector(mm_model, lm_model, lm_tokenizer, projector):
     """For now, dummy training instance, using CLIP dataset
@@ -370,7 +350,7 @@ def train_projector(mm_model, lm_model, lm_tokenizer, projector):
     # TEST FOR NORM OF TEXT EMBEDDING
     # batch_size = 32
     # train, test = load_dataset(dataset)
-    loss_fn = CLIPLoss() # Most important thing
+    loss_fn = None 
     projector_training_mode(mm_model, lm_model, projector)
 
     optimizer = torch.optim.AdamW(projector.parameters()) # Hyperparameters TBP w/ trianing args
@@ -392,12 +372,13 @@ def train_projector(mm_model, lm_model, lm_tokenizer, projector):
         input_str=description,
         image=image
         )
+    print(type(lm_model))
 
-    print(tokenizer)
-    print(text_embeds.size(), image_embeds.size())
-    loss = loss_fn(text_embeds, image_embeds)
+    """
+    loss = loss_fn(outputs, targets)
     loss.backward()
     optimizer.step()
+    """
     
     projector.save("/data3/jmarie/JoliVision/test-checkpoint/")
 
