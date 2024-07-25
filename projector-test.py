@@ -328,14 +328,24 @@ class CPMVQwenVLM(nn.Module):
 
         return
 
-    def train_projector(self):
+    def train_projector(
+            self,
+            batch_size: int=1,
+            lr: float=1e-3,
+            dataset=None
+        ):
+        
         """For now, dummy training instance, using CLIP dataset
         implement dataloader, add dataset_path argument to fn signature
         TO DO: allow for passing of training args for more fine-tuned fine-tuning
         """
-        # TEST FOR NORM OF TEXT EMBEDDING
-        # batch_size = 32
-        # train, test = load_dataset(dataset)
+        # TEST FOR NORM OF TEXT EMBEDDING which dimensions ?
+        if dataset is not None:
+            train, test = load_dataset(dataset)
+        
+        else:
+            train, test = None, None
+        
         self.projector_training_mode()
 
         optimizer = torch.optim.AdamW(self.projector.parameters()) # Hyperparameters TBP w/ trianing args
@@ -343,12 +353,15 @@ class CPMVQwenVLM(nn.Module):
 
 
         # Start for loop for batch processing
-        data_point = {"img_dir": "/home/jmarie/flares/positive_img/0001.png", "img_description": "A picture from the top of a train with the sky in the background. A flare appears from the train's pantograph."}
-        description = data_point["img_description"]
-        image = data_point["img_dir"]
         optimizer.zero_grad()
+        if dataset is None:
+            data_point = {"img_dir": "/home/jmarie/flares/positive_img/0001.png", "img_description": "A picture from the top of a train with the sky in the background. A flare appears from the train's pantograph."}
+            description = data_point["img_description"]
+            image = data_point["img_dir"]
+            logits, loss = self.forward(image=image, text=description, target=description)
 
-        logits, loss = self.forward(image=image, text=description, target=description)
+        else:
+            batch = 
         loss.backward()
         optimizer.step()
 
