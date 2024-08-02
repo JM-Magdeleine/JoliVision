@@ -31,6 +31,7 @@ import sys
 import torch
 import typing
 
+from tqdm import tqdm
 from torch import nn
 from PIL import Image
 from torch.nn.functional import cross_entropy
@@ -274,7 +275,7 @@ class CPMVQwenVLM(nn.Module):
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": input_str}
             ]
-            text = lm_tokenizer.apply_chat_template(
+            text = self.lm_tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True
@@ -292,12 +293,12 @@ class CPMVQwenVLM(nn.Module):
         mm_embeds = self.embed_mixed_modal(text, image)
 
         # Wrong !
-        generated_ids = self.lm_model(inputs_embeds=mm_embeds.unsqueeze_(0))
-        # generated_text = self.lm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        print("---------------- GENERATED IDS ----------------")
-        print(generated_ids.keys())
+        with open("/data3/jmarie/JoliVision/qwen-generate-source.py", "w") as file_reader:
+            file_reader.write(inspect.getsource(self.lm_model.generate))
+        generated_ids = self.lm_model.generate(mm_embeds.unsqueeze_(0), max_length=2048)
+        generated_text = self.lm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
-        return generated_ids
+        return generated_text
 
     def forward(self, text, image, target=None):
         mm_embeds = self.embed_mixed_modal(text, image, target)
@@ -305,10 +306,8 @@ class CPMVQwenVLM(nn.Module):
         # SELF.APPLY_MASK WHERE mask is applied for image-corresponding "tokens" ? implementation TBD
 
         labels = self.lm_tokenizer([target]) if target is not None else None
-        print("LABELS ::::::", mm_embeds.unsqueeze(0).size())
         res = self.lm_model(inputs_embeds=mm_embeds[...,:-1, :].unsqueeze(0), labels=labels)
 
-        print("REEEEEEEES", res.keys())
         return res
 
     def projector_training_mode(self):
@@ -331,6 +330,7 @@ class CPMVQwenVLM(nn.Module):
 
     def train_projector(
             self,
+            save_path,
             batch_size: int=1,
             lr: float=1e-3,
             dataset=None,
@@ -356,24 +356,33 @@ class CPMVQwenVLM(nn.Module):
         # Start for loop for batch processing
         optimizer.zero_grad()
         if dataset is None:
-            with open("/data3/jmarie/JoliVision/test-dataset.json", "r") as file_reader:
-                test = json.load(file_reader)
-            print("TESSSSSSSSSSSSSSSSSSSSST", test)
-            data_point = {"img_dir": "/home/jmarie/flares/positive_img/0001.png", "img_description": "A picture from the top of a train with the sky in the background. A flare appears from the train's pantograph."}
-            description = data_point["img_description"]
-            image = data_point["img_dir"]
-            result = self.forward(image=image, text=description)
-        loss = result["loss"]
-        logits = result["logits"]
-        print(logits.size())
+            with open("/data3/jmarie/JoliVision/test-dataset.json") as file_reader:
+                dataset = json.load(file_reader)
+        for data_point in tqdm(dataset):
+            description = data_point["prompt"]
+            image = data_point["image"]
+            result = self.forward(image=image, text=description, target=description)
+            loss = result["loss"]
+            print(loss)
             
-        loss.backward()
-        print(loss)
-        optimizer.step()
+            loss.backward()
+            optimizer.step()
 
-        self.projector.save("/data3/jmarie/JoliVision/test-checkpoint/test.pt")
+        self.projector.save(save_path)
 
         return
+
+    def test_trained_projector(self, load_path):
+        self.projector.load_projector_checkpoint(load_path)
+
+        with open("/data3/jmarie/JoliVision/test-dataset.json") as file_reader:
+            dataset = json.load(file_reader)
+
+        for data_point in tqdm(dataset):
+            description = data_point["prompt"]
+            image = data_point["image"]
+            print(image.split("/")[-1], self.generate("Describe this image", image))
+          
 
 # Example
 """print(generate(
@@ -387,4 +396,6 @@ class CPMVQwenVLM(nn.Module):
 # print(inspect.getmro(type(cpm.model.model)))
 vlm = CPMVQwenVLM(cpm, qwen, tokenizer, projector)
 print(os.path.abspath(inspect.getfile(qwen.forward)))
-vlm.train_projector()
+# vlm.train_projector("/data3/jmarie/JoliVision/test-checkpoint/test.pt")
+
+vlm.test_trained_projector("/data3/jmarie/JoliVision/test-checkpoint/test.pt")
