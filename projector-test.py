@@ -28,7 +28,6 @@ from torch import nn
 from PIL import Image
 from torch.nn.functional import cross_entropy
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
-from datasets import load_dataset
 
 # Testing imports
 import inspect
@@ -37,9 +36,9 @@ import inspect
 # but needed for CPMV classes ˇˇˇˇˇˇˇˇˇˇ
 sys.path.insert(0, "/data3/jmarie/MiniCPM-V")
 from chat import MiniCPMVChat, img2base64
-
 cpm = MiniCPMVChat('openbmb/MiniCPM-V-2')
 device = "cuda" if torch.cuda.is_available() else "cpu"
+torch.set_default_device(device)
 
 qwen = AutoModelForCausalLM.from_pretrained(
     "Qwen/Qwen2-0.5B-Instruct",
@@ -49,14 +48,8 @@ qwen = AutoModelForCausalLM.from_pretrained(
     )
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
 
-def image_bound_to_mask(embeds, image_bound):
-    image_seq_len = [ind_image_bound[-1][-1]-ind_image_bound[0][0] for ind_image_bound in image_bound]
-    mask = torch.ones(embeds.shape[:-1])
-    for idx, element in enumerate(embeds):
-        mask[idx, 1:(image_seq_len[idx]+1)] = 0
-    
-    return mask
-
+IMAGE_PREFIX_TOKENS = torch.tensor(tokenizer("A pitcure of").data["input_ids"])
+IMAGE_PREFIX_LEN = IMAGE_PREFIX_TOKENS.shape[-1]
 
 # Projector definition
 # Integrate to custom model class
@@ -99,10 +92,7 @@ class CPMQwenProjector(nn.Module):
             module.bias.data.fill_(0)
         return
 
-projector = CPMQwenProjector(cpm_dim=2304, qwen_dim=896).to(device).bfloat16() # TO DO moving to device and changing data type incorporated into class __init__ for completing /projector-class # fixfixfixfixfixfixfix
-
-dataset = load_dataset("liuhaotian/LLaVA-Pretrain")
-print(dataset)
+projector = CPMQwenProjector(cpm_dim=2304, qwen_dim=896).bfloat16() # TO DO moving to device and changing data type incorporated into class __init__ for completing /projector-class # fixfixfixfixfixfixfix
 
 class CPMVQwenVLM(nn.Module):
     # CLEAN UP THE DAMN CLASS, mm_model, mm_model.model.model, mm_model.model.tokenizer ????
@@ -236,9 +226,18 @@ class CPMVQwenVLM(nn.Module):
 
         # Recuperate embedded model_inputs, segment out image embeds
         image_bound, inputs_embeds = model_inputs["image_bound"], model_inputs["inputs_embeds"]
-        image_embeds = inputs_embeds[0][image_bound[0][0][0]: image_bound[0][-1][-1]] # for multiple image inference, replace image_embeds with a list to append to + change image_bound indices
-
+        image_embeds = inputs_embeds[0][image_bound[0][0][0]: image_bound[0][-1][-1]]
+        
         return image_embeds
+
+    def insert_image_embeds(self, lm_image_embeds, lm_text_embeds, lm_text_tokens):
+        flag = 0
+        for idx in range(len(lm_text_tokens) - IMAGE_PREFIX_LEN):
+            if lm_text_tokens[idx:idx+IMAGE_PREFIX_LEN] == IMAGE_PREFIX_TOKENS:
+                # fixfixfixfixfixfix right offset to check for correspondance of insertion ????
+                flag = idx + IMAGE_PREFIX_LEN
+
+        return torch.cat((lm_text_embeds[:flag], lm_image_embeds, lm_text_embeds[flag:]), dim=-1), flag-IMAGE_PREFIX_LEN, lm_image_embeds.shape[-2]+IMAGE_PREFIX_LEN
 
     # Update doc
     def embed_mixed_modal(self,
@@ -265,18 +264,19 @@ class CPMVQwenVLM(nn.Module):
         # MiniCPMV tokenization + getting visual embeddings
 
         mm_image_embeds = self.embed_image(input_str, image)
+        image_embeds_len = mm_image_embeds.shape[-2] + IMAGE_PREFIX_LEN
 
         lm_image_embeds = self.projector(mm_image_embeds) # change lm_image_embeds to list.append for /multi-image
 
         # Qwen tokenization
         # figure out how to shift tokens in this block
         if self.projector.training:
-            text = input_str
+            text = "A picture of" + input_str
 
         else:
             messages = [
                 {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": input_str}
+                {"role": "user", "content": "A picture of" + input_str}
             ]
             text = self.lm_tokenizer.apply_chat_template(
                 messages,
@@ -284,31 +284,50 @@ class CPMVQwenVLM(nn.Module):
                 add_generation_prompt=True
             )
 
-        lm_text_tokens = self.lm_tokenizer([text], return_tensors="pt").to(device)
-        target_tok = self.lm_tokenizer([text], return_tensors="pt").to(device)
-        lm_text_embeds = self.lm_model.get_input_embeddings()(lm_text_tokens["input_ids"][0]) # text tokens embedded in a 896-dimensional space
-        print("LM TEXT EMBEDS", lm_text_embeds.shape)
-        # CHECK FOR NORMALIZATION OF VECTORS
-        lm_embeds = torch.cat((lm_text_embeds[0].unsqueeze_(0), lm_image_embeds, lm_text_embeds[1:])) # Unsqueeze to match dimensions
-        if target is not None:
-            # image_mask = image_bound_to_mask(lm_embeds, image_bound) if target is not None else None
-            masked_target = torch.cat((target_tokens[0].unsqueeze(0), torch.fill((lm_image_embeds.shape[0]), target_tokens[1:]), -100))
-        else:
-            masked_target = None
 
-        return lm_embeds, masked_target
+        lm_text_tokens = self.lm_tokenizer([text], return_tensors="pt")
+        lm_text_embeds = self.lm_model.get_input_embeddings()(lm_text_tokens["input_ids"][0]) # text tokens embedded in a 896-dimensional space
+        
+        lm_embeds, image_start_idx, image_embeds_len = self.insert_image_embeds(lm_image_embeds, lm_text_embeds, lm_text_tokens)
+
+        # CHECK FOR NORMALIZATION OF VECTORS
+        if target is not None:
+            target_tokens = self.lm_tokenizer([text], return_tensors="pt")
+
+            masked_target = torch.cat(
+                (
+                    target_tokens.data["input_ids"][:image_start],
+                    torch.full((1, image_embeds_len), -100),
+                    target_tokens.data["input_ids"][image_start:]
+                ),
+                dim=-1
+            )
+
+            target_tokens.data["input_ids"] = masked_target
+            target_tokens.data["attention_mask"] = torch.ones_like(masked_target)
+
+        else:
+            target_tokens = None
+
+        return lm_embeds, target_tokens
 
     def generate(self, text: str, image: str):
         mm_embeds, _ = self.embed_mixed_modal(text, image)
 
-        generated_ids = self.lm_model.generate(inputs_embeds=mm_embeds.unsqueeze_(0), max_length=2048)
+        generated_ids = self.lm_model.generate(
+            inputs_embeds=mm_embeds.unsqueeze_(0),
+            max_length=2048
+        )
         generated_text = self.lm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
         return generated_text
 
     def forward(self, text, image, target=None):
-        mm_embeds, masked_labels = self.embed_mixed_modal(text, image, target)
-        res = self.lm_model(inputs_embeds=mm_embeds[...,:-1, :].unsqueeze(0), labels=masked_labels)
+        mm_embeds, labels_with_mask = self.embed_mixed_modal(text, image, target)
+        res = self.lm_model(
+            inputs_embeds=mm_embeds.unsqueeze(0),
+            labels=labels_with_mask
+        )
 
         return res
 
@@ -350,7 +369,7 @@ class CPMVQwenVLM(nn.Module):
 
         self.projector_training_mode()
 
-        optimizer = torch.optim.AdamW(self.projector.parameters()) # Hyperparameters TBP w/ trianing args
+        optimizer = torch.optim.AdamW(self.projector.parameters(), lr=lr) # Hyperparameters TBP w/ trianing args
         # lr_scheduler = CosineAnnealingLR(optimizer=optimizer, T_max=50) # Same here, also implement WSD act MiniCPM
 
 
@@ -358,29 +377,34 @@ class CPMVQwenVLM(nn.Module):
         optimizer.zero_grad()
         if dataset is None:
             # Default dataset is LLaVA Instruct 595k augmented with SNCF dataset
-            data_path = "/data3/jmarie/JoliVision/LLaVA-CC3M-Pretrain-595k/images/"
-            with open("/data3/jmarie/JoliVision/LLaVA-CC3M-Pretrain-595k/chat-aug.json") as dataset_reader:
-                dataset = json.load(file_reader)
+            data_path = "/data3/jmarie/JoliVision/LLaVA-CC3M-Pretrain-595K/images/"
+            with open("/data3/jmarie/JoliVision/LLaVA-CC3M-Pretrain-595K/chat-aug.json") as dataset_reader:
+                dataset = json.load(dataset_reader)
+
         for data_point in tqdm(dataset):
             try:
-                conversation = data_point["prompt"]
+                caption = data_point["conversations"][1]["value"]
                 image = os.path.join(data_path, data_point["image"])
-                result = self.forward(image=image, text=description, target=description)
+                
+                result = self.forward(image=image, text=caption, target=caption)
                 loss = result["loss"]
                 print(loss)
                 
                 loss.backward()
                 optimizer.step()
-          
+            
             except:
+                # Fix traceback and printing of exception
                 exc_type, exc_value, exc_traceback = sys.exc_info()
-                print(exc_traceback)
-                print(f"The following error was raison: {exc_type}")
-                print(f"Training was terminated for the follwing reason: {exc_value}")
+                ["tb_frame", "tb_lasti", "tb_lineno", "tb_next"]
+                print(f"Trainining terminated because of the exception: {repr(exc_type)}")
+                print(f"Training was terminated on the ground of: {exc_value}")
                 
                 self.projector.save(save_path) # Change to save the state with the training progress as well
+                print("projector saved!")
                 
                 sys.exit(1)
+                
 
         self.projector.save(save_path)
 
@@ -389,29 +413,30 @@ class CPMVQwenVLM(nn.Module):
     def test_trained_projector(self, load_path):
         self.projector.load_projector_checkpoint(load_path)
 
-        with open("/data3/jmarie/JoliVision/test-dataset.json") as file_reader:
+        with open("/data3/jmarie/JoliVision/dataset.json") as file_reader:
             dataset = json.load(file_reader)
 
         for data_point in tqdm(dataset):
             description = data_point["prompt"]
             image = data_point["image"]
-            print(image.split("/")[-1], self.generate("Repeat the past text.", image))
+            print(image.split("/")[-1], self.generate("Here is the content of the image: ", image))
         
         return
 
 
+# print(cpm.model.model.__dict__.keys())
+# print(inspect.getmro(type(cpm.model.model)))
+vlm = CPMVQwenVLM(cpm, qwen, tokenizer, projector)
+# print(os.path.abspath(inspect.getfile(qwen.forward)))
+
 # Example
-"""print(generate(
+print(vlm.generate(
       "Describe the image I just gave you",
       "/home/jmarie/flares/positive_img/0000.png"
     )
 )
-"""
 
-# print(cpm.model.model.__dict__.keys())
-# print(inspect.getmro(type(cpm.model.model)))
-vlm = CPMVQwenVLM(cpm, qwen, tokenizer, projector)
-print(os.path.abspath(inspect.getfile(qwen.forward)))
-#vlm.train_projector(save_path="/data3/jmarie/JoliVision/test-checkpoint/test.pt", dataset="liuhaotian/LLaVA-Pretrain")
 
-#vlm.test_trained_projector("/data3/jmarie/JoliVision/test-checkpoint/test.pt")
+vlm.train_projector(save_path="/data3/jmarie/JoliVision/test-checkpoint/test.pt", lr=1e-2)
+
+# vlm.test_trained_projector("/data3/jmarie/JoliVision/test-checkpoint/test.pt")
