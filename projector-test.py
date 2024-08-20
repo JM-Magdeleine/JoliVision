@@ -323,8 +323,7 @@ class CPMVQwenVLM(nn.Module):
             
             target_tokens.data["input_ids"] = masked_target
             target_tokens.data["attention_mask"] = torch.ones_like(masked_target)
-            print("TOKEN MATCHING", lm_embeds.shape, masked_target.shape)
-
+            
         else:
             target_tokens = None
         
@@ -416,7 +415,7 @@ class CPMVQwenVLM(nn.Module):
                 self.projector.save(save_path) # Change to save the state with the training progress as well
                 print("projector saved!")
 
-                with open(os.path.join(save_path, "training-log"), "w") as train_logger:
+                with open("/data3/jmarie/JoliVision/test-checkpoint/training-log.txt", "w") as train_logger:
                     json.dump(log, train_logger)
                     print("training log successfully saved")
 
@@ -438,7 +437,7 @@ class CPMVQwenVLM(nn.Module):
         self.projector.save(save_path)
 
         # Revisit the logging
-        with open(os.path.join(save_path, "training-log"), "w") as train_logger:
+        with open("/data3/jmarie/JoliVision/test-checkpoint/training-log.txt", "w") as train_logger:
             json.dump(log, train_logger)
 
         self.eval_projector(load_path=save_path, dataset=test)
