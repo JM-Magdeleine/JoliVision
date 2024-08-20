@@ -19,6 +19,7 @@ import base64
 import io
 import json
 import os
+import random
 import sys
 import torch
 import typing
@@ -31,6 +32,7 @@ from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 # Testing imports
 import inspect
+import traceback
 
 # TO DO need to remove this line to get rid of local dependencies,
 # but needed for CPMV classes ˇˇˇˇˇˇˇˇˇˇ
@@ -48,7 +50,7 @@ qwen = AutoModelForCausalLM.from_pretrained(
     )
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
 
-IMAGE_PREFIX_TOKENS = torch.tensor(tokenizer("A pitcure of").data["input_ids"])
+IMAGE_PREFIX_TOKENS = torch.tensor(tokenizer("An image containing ").data["input_ids"])
 IMAGE_PREFIX_LEN = IMAGE_PREFIX_TOKENS.shape[-1]
 
 # Projector definition
@@ -232,12 +234,19 @@ class CPMVQwenVLM(nn.Module):
 
     def insert_image_embeds(self, lm_image_embeds, lm_text_embeds, lm_text_tokens):
         flag = 0
+        # print("SHAPES")
+        # print(lm_image_embeds.shape)
+        # print(lm_text_tokens.data["input_ids"].shape)
+        # print(lm_text_embeds.shape)
         for idx in range(len(lm_text_tokens) - IMAGE_PREFIX_LEN):
             if lm_text_tokens[idx:idx+IMAGE_PREFIX_LEN] == IMAGE_PREFIX_TOKENS:
-                # fixfixfixfixfixfix right offset to check for correspondance of insertion ????
                 flag = idx + IMAGE_PREFIX_LEN
+        # print(flag)
+        if flag == 0:
+            return torch.cat((lm_image_embeds, lm_text_embeds)), 0, lm_image_embeds.shape[-2]
 
-        return torch.cat((lm_text_embeds[:flag], lm_image_embeds, lm_text_embeds[flag:]), dim=-1), flag-IMAGE_PREFIX_LEN, lm_image_embeds.shape[-2]+IMAGE_PREFIX_LEN
+
+        return torch.cat((lm_text_embeds[:flag], lm_image_embeds, lm_text_embeds[flag:])), flag, lm_image_embeds.shape[-2]
 
     # Update doc
     def embed_mixed_modal(self,
@@ -271,12 +280,12 @@ class CPMVQwenVLM(nn.Module):
         # Qwen tokenization
         # figure out how to shift tokens in this block
         if self.projector.training:
-            text = "A picture of" + input_str
+            text = "An image containing " + input_str
 
         else:
             messages = [
                 {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": "A picture of" + input_str}
+                {"role": "user", "content": "An image containing " + input_str}
             ]
             text = self.lm_tokenizer.apply_chat_template(
                 messages,
@@ -294,21 +303,31 @@ class CPMVQwenVLM(nn.Module):
         if target is not None:
             target_tokens = self.lm_tokenizer([text], return_tensors="pt")
 
-            masked_target = torch.cat(
-                (
-                    target_tokens.data["input_ids"][:image_start],
-                    torch.full((1, image_embeds_len), -100),
-                    target_tokens.data["input_ids"][image_start:]
-                ),
-                dim=-1
-            )
-
+            if image_start_idx == 0:
+                masked_target = torch.cat(
+                    (
+                        torch.full((1, image_embeds_len), -100),
+                        target_tokens.data["input_ids"]
+                    ),
+                    dim=-1
+                )
+            else:
+                masked_target = torch.cat(
+                    (
+                        target_tokens.data["input_ids"][:image_start_idx],
+                        torch.full((1, image_embeds_len), -100),
+                        target_tokens.data["input_ids"][image_start_idx:]
+                    ),
+                    dim=-1
+                )
+            
             target_tokens.data["input_ids"] = masked_target
             target_tokens.data["attention_mask"] = torch.ones_like(masked_target)
+            print("TOKEN MATCHING", lm_embeds.shape, masked_target.shape)
 
         else:
             target_tokens = None
-
+        
         return lm_embeds, target_tokens
 
     def generate(self, text: str, image: str):
@@ -354,73 +373,99 @@ class CPMVQwenVLM(nn.Module):
             batch_size: int=1,
             lr: float=1e-3,
             dataset=None,
+            train=None,
+            test=None
         ):
-
-        """For now, dummy training instance, using CLIP dataset
-        implement dataloader, add dataset_path argument to fn signature
-        TO DO: allow for passing of training args for more fine-tuned fine-tuning
-        """
+        log_frequency = 10 # How many training steps to be done between two train loss logs
         # TEST FOR NORM OF TEXT EMBEDDING which dimensions ?
         if dataset is not None:
             train, test = load_dataset(dataset)
 
-        else:
-            train, test = None, None
+        if dataset is None and train is None and test is None:
+            # Default dataset is LLaVA Instruct 595k augmented with SNCF dataset
+            data_path = "/data3/jmarie/JoliVision/LLaVA-CC3M-Pretrain-595K/images/"
+            with open("/data3/jmarie/JoliVision/LLaVA-CC3M-Pretrain-595K/mini-llava-train.json") as train_dataset_reader:
+                train = json.load(train_dataset_reader)
+            with open("/data3/jmarie/JoliVision/LLaVA-CC3M-Pretrain-595K/mini-llava-test.json") as test_dataset_reader:
+                test = json.load(test_dataset_reader)
+
 
         self.projector_training_mode()
 
         optimizer = torch.optim.AdamW(self.projector.parameters(), lr=lr) # Hyperparameters TBP w/ trianing args
         # lr_scheduler = CosineAnnealingLR(optimizer=optimizer, T_max=50) # Same here, also implement WSD act MiniCPM
 
-
-        # Start loop for batch processing ----> ???
         optimizer.zero_grad()
-        if dataset is None:
-            # Default dataset is LLaVA Instruct 595k augmented with SNCF dataset
-            data_path = "/data3/jmarie/JoliVision/LLaVA-CC3M-Pretrain-595K/images/"
-            with open("/data3/jmarie/JoliVision/LLaVA-CC3M-Pretrain-595K/chat-aug.json") as dataset_reader:
-                dataset = json.load(dataset_reader)
 
-        for data_point in tqdm(dataset):
+        log = []
+        train_step, eval_step, train_loss = 0, 0, torch.zeros(1)
+        for data_point in tqdm(train):
             try:
                 caption = data_point["conversations"][1]["value"]
                 image = os.path.join(data_path, data_point["image"])
                 
                 result = self.forward(image=image, text=caption, target=caption)
                 loss = result["loss"]
-                print(loss)
+                train_loss += loss
                 
                 loss.backward()
                 optimizer.step()
             
             except:
-                # Fix traceback and printing of exception
-                exc_type, exc_value, exc_traceback = sys.exc_info()
-                ["tb_frame", "tb_lasti", "tb_lineno", "tb_next"]
-                print(f"Trainining terminated because of the exception: {repr(exc_type)}")
-                print(f"Training was terminated on the ground of: {exc_value}")
-                
+                traceback.print_exc()
                 self.projector.save(save_path) # Change to save the state with the training progress as well
                 print("projector saved!")
-                
+
+                with open(os.path.join(save_path, "training-log"), "w") as train_logger:
+                    json.dump(log, train_logger)
+                    print("training log successfully saved")
+
                 sys.exit(1)
-                
+
+            if train_step % 10 == 0:
+                # Revisit the logging
+                log.append(f"Training step {train_step} loss: {train_loss/10}")
+                train_loss = torch.zeros(1)
+
+            if train_step % 1000 == 0:
+                eval_step += 1
+                self.projector.save(save_path)
+                print(train_loss)
+                # self.eval_projector(load_path=save_path, dataset=train, eval_step=eval_step)
+            
+            train_step += 1
 
         self.projector.save(save_path)
 
+        # Revisit the logging
+        with open(os.path.join(save_path, "training-log"), "w") as train_logger:
+            json.dump(log, train_logger)
+
+        self.eval_projector(load_path=save_path, dataset=test)
+        
         return
 
-    def test_trained_projector(self, load_path):
+    def eval_projector(self, load_path=None, dataset=None, eval_step=-1):
+        # In development
         self.projector.load_projector_checkpoint(load_path)
+        self.projector.eval()
 
-        with open("/data3/jmarie/JoliVision/dataset.json") as file_reader:
-            dataset = json.load(file_reader)
+        data_path = "/data3/jmarie/JoliVision/LLaVA-CC3M-Pretrain-595K/images/"
+
+        if dataset is None:
+            with open("/data3/jmarie/JoliVision/dataset.json") as file_reader:
+                dataset = json.load(file_reader)
 
         for data_point in tqdm(dataset):
-            description = data_point["prompt"]
-            image = data_point["image"]
-            print(image.split("/")[-1], self.generate("Here is the content of the image: ", image))
-        
+            description = data_point["conversations"][1]["value"]
+            image = os.path.join(data_path, data_point["image"])
+            result = self.forward(image=image, text=caption, target=caption)
+
+            loss += result["loss"]
+
+        with open("/data3/jmarie/JoliVision/train_logger.txt") as train_logger:
+            train_logger.write(f"Eval step {eval_step}: {loss[0]/len(dataset)}")
+            
         return
 
 
@@ -439,4 +484,4 @@ print(vlm.generate(
 
 vlm.train_projector(save_path="/data3/jmarie/JoliVision/test-checkpoint/test.pt", lr=1e-2)
 
-# vlm.test_trained_projector("/data3/jmarie/JoliVision/test-checkpoint/test.pt")
+# vlm.eval_projector("/data3/jmarie/JoliVision/test-checkpoint/test.pt")
