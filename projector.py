@@ -349,6 +349,21 @@ class CPMVQwenVLM(nn.Module):
 
         return res
 
+    def projector_eval_mode(self):
+        self.mm_model.model.model.eval()
+        for parameter in self.mm_model.model.model.parameters():
+            parameter.requires_grad = False
+
+        self.lm_model.eval()
+        for parameter in self.lm_model.parameters():
+            parameter.requires_grad = False
+
+        self.projector.eval()
+        for parameter in self.projector.parameters():
+            parameter.requires_grad = False
+
+        return
+
     def projector_training_mode(self):
         # Freeze multimodal model
         self.mm_model.model.model.eval()
@@ -373,7 +388,8 @@ class CPMVQwenVLM(nn.Module):
             lr: float=1e-3,
             dataset=None,
             train=None,
-            test=None
+            test=None,
+            testing=False
         ):
         log_frequency = 10 # How many training steps to be done between two train loss logs
         # TEST FOR NORM OF TEXT EMBEDDING which dimensions ?
@@ -406,6 +422,17 @@ class CPMVQwenVLM(nn.Module):
                 result = self.forward(image=image, text=caption, target=caption)
                 loss = result["loss"]
                 train_loss += loss
+
+                if train_step % 10 == 0:
+                    # Revisit the logging
+                    log.append(f"Training step {train_step} loss: {(train_loss/10).tolist()[0]}")
+                    train_loss = torch.zeros(1)
+
+                if train_step % 1000 == 0:
+                    self.projector.save(save_path)
+                    print(train_loss)
+                    # self.eval_projector(load_path=save_path, dataset=train, eval_step=eval_step)
+                    # eval_step += 1
                 
                 loss.backward()
                 optimizer.step()
@@ -420,17 +447,6 @@ class CPMVQwenVLM(nn.Module):
                     print("training log successfully saved")
 
                 sys.exit(1)
-
-            if train_step % 10 == 0:
-                # Revisit the logging
-                log.append(f"Training step {train_step} loss: {train_loss/10}")
-                train_loss = torch.zeros(1)
-
-            if train_step % 1000 == 0:
-                eval_step += 1
-                self.projector.save(save_path)
-                print(train_loss)
-                # self.eval_projector(load_path=save_path, dataset=train, eval_step=eval_step)
             
             train_step += 1
 
@@ -440,30 +456,48 @@ class CPMVQwenVLM(nn.Module):
         with open("/data3/jmarie/JoliVision/test-checkpoint/training-log.txt", "w") as train_logger:
             json.dump(log, train_logger)
 
-        self.eval_projector(load_path=save_path, dataset=test)
+        if testing:
+            self.eval_projector(load_path=save_path, dataset=test)
+
+        self.projector_eval_mode()
         
         return
 
-    def eval_projector(self, load_path=None, dataset=None, eval_step=-1):
+    def eval_projector(
+            self,
+            load_path=None,
+            dataset=None,
+            eval_step=-1,
+            save_results=False,
+            result_save_file=None
+    ):
         # In development
-        self.projector.load_projector_checkpoint(load_path)
-        self.projector.eval()
+        if load_path is not None:
+            self.projector.load_projector_checkpoint(load_path)
+        self.projector_eval_mode()
 
         data_path = "/data3/jmarie/JoliVision/LLaVA-CC3M-Pretrain-595K/images/"
 
         if dataset is None:
-            with open("/data3/jmarie/JoliVision/dataset.json") as file_reader:
+            with open("/data3/jmarie/JoliVision/LLaVA-CC3M-Pretrain-595K/mini-llava-test.json") as file_reader:
                 dataset = json.load(file_reader)
 
+        print(torch.cuda.mem_get_info())
+
+        total_loss = torch.zeros(1)
         for data_point in tqdm(dataset):
-            description = data_point["conversations"][1]["value"]
+            caption = data_point["conversations"][1]["value"]
             image = os.path.join(data_path, data_point["image"])
             result = self.forward(image=image, text=caption, target=caption)
 
-            loss += result["loss"]
+            total_loss += result["loss"]
 
-        with open("/data3/jmarie/JoliVision/train_logger.txt") as train_logger:
-            train_logger.write(f"Eval step {eval_step}: {loss[0]/len(dataset)}")
+        if save_results and result_save_file is None:
+            with open("/data3/jmarie/JoliVision/test-checkpoint/training-log.txt", "a") as test_logger:
+                test_logger.write(f"Eval step {eval_step} testing loss: {total_loss[0]/len(dataset)}")
+        elif result_save_file is not None:
+            with open(result_save_file, "w") as test_logger:
+                test_logger.write(f"Eval step {eval_step} testing loss: {total_loss[0]/len(dataset)}")
             
         return
 
@@ -474,6 +508,7 @@ vlm = CPMVQwenVLM(cpm, qwen, tokenizer, projector)
 # print(os.path.abspath(inspect.getfile(qwen.forward)))
 
 # Example
+
 print(vlm.generate(
       "Describe the image I just gave you",
       "/home/jmarie/flares/positive_img/0000.png"
@@ -481,6 +516,9 @@ print(vlm.generate(
 )
 
 
-vlm.train_projector(save_path="/data3/jmarie/JoliVision/test-checkpoint/test.pt", lr=1e-2)
+# vlm.train_projector(save_path="/data3/jmarie/JoliVision/test-checkpoint/test.pt", lr=1e-2, testing=False)
 
-# vlm.eval_projector("/data3/jmarie/JoliVision/test-checkpoint/test.pt")
+vlm.eval_projector("/data3/jmarie/JoliVision/test-checkpoint/test.pt")
+
+# vlm_random = CPMVQwenVLM(cpm, qwen, tokenizer, CPMVQwenProjector(cpm_dim=2304, qwen_dim=896).bfloat16())
+# vlm_random.eval_projector()
