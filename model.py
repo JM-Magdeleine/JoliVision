@@ -1,3 +1,21 @@
+"""Definition of CPM Vision tower + projector + Qwen decoder model
+
+WIP: batch processing implementation; LLaVA metrics calculations;
+training/testing logger
+check for normalization of text embeddings
+
+
+Ideas: get rid of loading the whole Mini-CPM-V model?
+get rid of hardcoded path inesrtion for CPM model
+ablation test to check whether encoding vision embeddings in context is useful
+    for feature extraction
+support for web images
+clean up embed image function signature
+Shift Qwen inputs to include gap (unk token?) where image embeds will be squeezed in
+
+Feature ideas:
+apply support for learning rate customization
+"""
 import base64
 import io
 import json
@@ -11,22 +29,22 @@ import typing
 from tqdm import tqdm
 from torch import nn
 from PIL import Image
-from torch.nn.functional import cross_entropy
-from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
-
-# Testing imports
-import inspect
-import traceback
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from projector import CPMQwenProjector
 
-# TO DO need to remove this line to get rid of local dependencies,
-# but needed for CPMV classes ˇˇˇˇˇˇˇˇˇˇ
-sys.path.insert(0, "/data3/jmarie/MiniCPM-V")
-from chat import MiniCPMVChat, img2base64
-cpm = MiniCPMVChat('openbmb/MiniCPM-V-2')
+import inspect
+import traceback
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.set_default_device(device)
+# torch.set_default_dtype(torch.bfloat16)
+
+
+sys.path.insert(0, "/data3/jmarie/MiniCPM-V") # from minicpmv.chat import MiniCPMVChat, img2base64
+from chat import MiniCPMVChat, img2base64
+cpm = MiniCPMVChat('openbmb/MiniCPM-V-2')
+
 
 qwen = AutoModelForCausalLM.from_pretrained(
     "Qwen/Qwen2-0.5B-Instruct",
@@ -34,16 +52,15 @@ qwen = AutoModelForCausalLM.from_pretrained(
     device_map="auto",
     attn_implementation="flash_attention_2"
     )
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B-Instruct", padding_side="left")
 
 IMAGE_PREFIX_TOKENS = torch.tensor(tokenizer("An image containing ").data["input_ids"])
 IMAGE_PREFIX_LEN = IMAGE_PREFIX_TOKENS.shape[-1]
 
 class CPMVQwenVLM(nn.Module):
-    # CLEAN UP THE DAMN CLASS, mm_model, mm_model.model.model, mm_model.model.tokenizer ????
     def __init__(self, mm_model, lm_model, lm_tokenizer, projector):
         super().__init__()
-        self.mm_model = mm_model
+        self.mm_model = mm_model # contains entire CPM model, including tokenizer
         self.lm_model = lm_model
         self.lm_tokenizer = lm_tokenizer
         self.projector = projector
@@ -57,23 +74,20 @@ class CPMVQwenVLM(nn.Module):
                     max_inp_length: int=2048,
                     **kwargs) -> torch.Tensor:
         """Get image embeddings from MiniCPMV's vision tower, including slice embeddings
-        and other embeddings necessary for image context. (Get a list of em?)
+        and other embeddings necessary for image context. No batch processing yet.
+        Heavily borrowed from MiniCPM-V code.
         Args:
             input_str: input string as provided by user
-            image: ABSOLUTE file path to the image to be embedded. Web images are not supported, must be locally saved image
+            image: absolute file path to the image to be embedded. Web images are not supported, must be locally saved image
             max_input_length: ????
             kwargs: ??? Used in original MiniCPMV code but idk what use they have here
 
         Returns:
-            `torch.Tensor` of shape (1, `len(image_embeds)`, `cpm_embedding_dim`):
+            `torch.Tensor` 3D tensor:
                 The image embeddings, with context included (split token embeddings, ...)
         """
-        # Explore whether the whole input conditioning is better for projector training
-        # Rethink using embeddings within the context of the sentence
-        # (can it learn the influence of the position of the image in the sentence?)
-
-        model = self.mm_model.model.model # class MiniCPMV
-        tokenizer = self.mm_model.model.tokenizer # class PreTrainedTokenizer
+        model = self.mm_model.model.model # extract actual MiniCPMV model
+        tokenizer = self.mm_model.model.tokenizer # exctract actual PreTrainedTokenizer tokenizer
         vision_hidden_states = None # Necessary?
         sampling = True # Review use of sampling
 
@@ -175,67 +189,83 @@ class CPMVQwenVLM(nn.Module):
 
         return image_embeds
 
-    def insert_image_embeds(self, lm_image_embeds, lm_text_embeds, lm_text_tokens):
+    def insert_image_embeds(self, lm_image_embeds, lm_text_embeds, lm_text_tokens_list):
         flags = []
-        for seq_idx in range(lm_text_tokens.shape[0]):
+        for lm_text_tokens in lm_text_tokens_list:
             flag = 0
             for idx in range(len(lm_text_tokens) - IMAGE_PREFIX_LEN):
                 if lm_text_tokens[idx:idx+IMAGE_PREFIX_LEN] == IMAGE_PREFIX_TOKENS:
                     flag = idx + IMAGE_PREFIX_LEN
 
             if flag == 0:
-                return torch.cat((lm_image_embeds, lm_text_embeds)), 0, lm_image_embeds.shape[-2]
+                # encountered in training
+                return [torch.cat((lm_image_embed, lm_text_embed)) for lm_image_embed, lm_text_embed in zip(lm_image_embeds, lm_text_embeds)], [0]*len(lm_text_embeds), [lm_image_embed.shape[-2] for lm_image_embed in lm_image_embeds]
             flags.append(flag)
 
-        return [torch.cat((lm_text_embed[:flag], lm_image_embed, lm_text_embed[flag:]), dim=-1) for flag, lm_text_embed, lm_image_embed in zip(flag, lm_text_embeds, lm_image_embeds)], flags, [lm_image_embed.shape[-2] for lm_image_embed in lm_image_embeds]
+        return [torch.cat((lm_text_embed[:flag], lm_image_embed, lm_text_embed[flag:]), dim=-1) for flag, lm_text_embed, lm_image_embed in zip(flags, lm_text_embeds, lm_image_embeds)], flags, [lm_image_embed.shape[-2] for lm_image_embed in lm_image_embeds]
 
-    def pad_batch(tensors_list: list[torch.Tensor],
-                  padding_side: str=None
-                  ) -> torch.Tensor:
-        max_size = max([tensor.shape[0] for tensor in tensors_list])
-        pads = [torch.tensor(1+max_size-tensor.shape[0]) for tensor in tensors_list]
-
-        if padding_side is None:
-            # Padding is right by default
-            batch = torch.stack([torch.cat((pad, tensor)) for pad, tensor in zip(pads, tensors_list) if ])
+    def make_batch(self, tensor_list: list[torch.Tensor], padding_side: str="right", pad_value: int=0):
+        """Make N+1 D-tensor corresponding to batch given the list of N D-tensors
+        Args:
+            tensor_list: list of `torch.Tensor` objects to be made into a batch
+            padding_side: string indicating which side to pad to, defaults to left
+            pad_value: integer to use for padding, defaults to 0
         
-        return batch[:, 1:, ...]
+        Returns
+            batch: `torch.Tensor` batch tensor of dimensions (`len(tensor_list)`, `tensor.shape`)
+            attention_mask: `torch.Tensor` batch tensor of the same dimensions,
+                with values of 0 where padding has been applied
+        """
+        max_len = max([tensor.shape[-2] for tensor in tensor_list])
+        batch = torch.full((len(tensor_list), max_len, tensor_list[0].shape[-1]), pad_value)
+        attention_mask = torch.zeros_like(batch)
+
+        for i, tensor in enumerate(tensor_list):
+            if padding_side == "left":
+                batch[i, max_len - tensor.shape[-2]:, :] = tensor
+                attention_mask[i, max_len - tensor.shape[-2]:, :] = 1
+            else:
+                batch[i, :tensor.shape[-2], :] = tensor
+                attention_mask[i, :tensor.shape[-2], :] = 1
+                
+        return batch.to(torch.bfloat16), attention_mask.to(torch.bfloat16)
 
     # Update doc
     def embed_mixed_modal(self,
                           input_str_list: list[str],
                           image_list: list[str],
-                          target_list: list[str]=None,
+                          targets_list: list[str]=None,
                           sampling: bool=True) -> torch.Tensor:
         """Embed mixed-modal data to the Qwen embedding space. The data is embedded
-        to the cpm multimodal space. The image embeds are picked out and subsequently
-        projected to the Qwen embedding space using a linear GELU unit.
-        All inputs preparation for embedding is done here (formatting + prompting + tokenization)
+        to the cpm multimodal space. The image embeds are then picked and projected
+        into the Qwen embedding space.
+        Does: formatting + prompting + tokenization + embedding
         Args:
-            input_str: the complete string input from the user
-            image: image absolute path as image input. Does NOT curr support web images
-            sampling: idky, it's there, and it's used in CPM embedding
+            input_str_list: lsit of string inputs for processing
+            image_list: list of image absolute paths for image inputs. Does not curr support web images
+            sampling: idky, it's there + it's used in CPM embedding
 
         Returns:
-            lm_embeds: `torch.Tensor` of shape (1 (/batch_len), `len(input_ids)`, `qwen_embedding_space_dims`):
-                Embeddings of the multimodal inputs, with the picture projected embeddings
-                before the qwen text embeds
-            image_mask: `torch.Tensor` of shape (1, len(input_ids)), 0 indicating the presence of an image or image-related token
+            lm_embeds: `torch.Tensor` of shape (batch_size, `len(input_ids)`, `qwen_embedding_space_dims`):
+                Embeddings of the multimodal inputs, with the qwen embeds concatenated with
+                the complete image embeds
+            target_tokens: `torch.Tensor` of shape (batch_size, len(input_ids)):
+                Qwen input tokens with -100 where image "tokens" appear, useful for loss calculation by Qwen
         """
         # Maybe shift Qwen inputs prior to embedding? Would help for context for decoder
-        # MiniCPMV tokenization + getting visual embeddings
-
-        mm_image_embeds = torch.cat(
-            [self.embed_image(input_str, image) for input_str, image in zip(input_str_list, image_list)],
-            dim=0
-        )
+        
+        # Qwen-projected vision embeddings
+        mm_image_embeds, _ = self.make_batch([(
+            self.embed_image(input_str, image)
+        ) for input_str, image in zip(input_str_list, image_list)])
+        mm_image_embeds = mm_image_embeds.unsqueeze(0) if mm_image_embeds.dim() == 2 else mm_image_embeds
         image_embeds_len_list = [mm_image_embed.shape[-2] + IMAGE_PREFIX_LEN for mm_image_embed in mm_image_embeds]
 
         lm_image_embeds = self.projector(mm_image_embeds)
-
+        
         # Qwen tokenization
-        # figure out how to shift tokens in this block
         if self.projector.training:
+            # Captioning task
             text_list = ["An image containing " + input_str for input_str in input_str_list]
 
         else:
@@ -252,73 +282,79 @@ class CPMVQwenVLM(nn.Module):
             )
 
 
-        lm_text_tokens_list = self.lm_tokenizer(text_list, return_tensors="pt")
-        lm_text_embeds = self.lm_model.get_input_embeddings()(lm_text_tokens["input_ids"]) # text tokens embedded in a 896-dimensional space
+        lm_text_tokens_list = self.lm_tokenizer(text_list)
+        lm_text_embeds_list = [self.lm_model.get_input_embeddings()(torch.tensor(lm_text_tokens)) for lm_text_tokens in lm_text_tokens_list["input_ids"]] # text tokens embedded in a 896-dimensional space
 
-        lm_embeds_list, image_start_idx_list, image_embeds_len_list = self.insert_image_embeds(lm_image_embeds, lm_text_embeds, lm_text_tokens_list)
+        lm_embeds_list, image_start_idx_list, image_embeds_len_list = self.insert_image_embeds(lm_image_embeds, lm_text_embeds_list, lm_text_tokens_list)
 
-        # CHECK FOR NORMALIZATION OF VECTORS
-        if target_list is not None:
-            target_tokens_list = self.lm_tokenizer(text_list, return_tensors="pt")
+        if targets_list is not None:
+            targets = self.lm_tokenzier(targets_list)
+            targets_list = targets["input_ids"]
 
             if image_start_idx_list[0] == 0:
+                # For size compatibility purposes, check if inserting at the start
+                # Insert -100 tokens where image embeds are placed
                 masked_targets_list = [
                     torch.cat(
                         (
                             torch.full((1, image_embeds_len), -100),
-                            target_tokens.data["input_ids"]
+                            targets_ind.data
                         ),
                         dim=-1
-                    ) for image_embeds_len in image_embeds_len_list
+                    ) for image_embeds_len, targets_ind in zip(image_embeds_len_list, targets_list)
                 ]
             else:
                 masked_targets_list = [
                     torch.cat(
                         (
-                            target_tokens.data["input_ids"][:image_start_idx],
+                            targets_ind.data[:image_start_idx],
                             torch.full((1, image_embeds_len), -100),
-                            target_tokens.data["input_ids"][image_start_idx:]
+                            targets_ind.data[image_start_idx:]
                         ),
                         dim=-1
-                    ) for image_start_idx, image_embeds_len in zip(image_start_idx_list, image_embeds_len_list)
+                    ) for image_start_idx, image_embeds_len, targets_ind in zip(image_start_idx_list, image_embeds_len_list, targets_list)
                 ]
-            masked_targets = pad_batch(masked_targets_list)
-            target_tokens.data["input_ids"] = masked_targets
-            target_tokens.data["attention_mask"] = torch.ones_like(masked_targets)
+            masked_targets, attention_mask = self.make_batch(tensor_list=masked_targets_list, pad_value=0)
+            targets.data["input_ids"] = masked_targets
+            targets.data["attention_mask"] = attention_mask
 
         else:
-            target_tokens = None
+            targets = None
 
-        lm_embeds = pad_batch(lm_embeds_list)
+        lm_embeds, attentions = self.make_batch(lm_embeds_list, pad_value=0)
 
-        return lm_embeds, target_tokens
+        if targets is not None:
+            return lm_embeds, targets
+        else:
+            return lm_embeds, attentions
 
-    def make_batch(self, ):
-
-      return
-
-    def generate(self, text: str, image: str):
-        batch_embeds, _ = make_batch(...)
-        mm_embeds, _ = self.embed_mixed_modal(text, image)
-
+    def generate(self, text_list: list[str], image_list: list[str]):
+        """Can only get it to work with batch_size 1 for the moment,
+        does not want to recognize padding for some reason, so it will
+        raise a ValueError stating that padding_side="right" with the tokenizer
+        """
+        mm_embeds, _ = self.embed_mixed_modal(text_list, image_list)
+        mm_embeds = mm_embeds.squeeze(0)
         generated_ids = self.lm_model.generate(
-            inputs_embeds=mm_embeds.unsqueeze_(0),
+            inputs_embeds=mm_embeds.unsqueeze(0),
             max_length=2048
         )
         generated_text = self.lm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
         return generated_text
 
-    def forward(self, text, image, target=None):
-        mm_embeds, labels_with_mask = self.embed_mixed_modal(text, image, target)
+    def forward(self, text_list, image_list, targets_list=None):
+        mm_embeds, targets = self.embed_mixed_modal(text_list, image_list, targets_list)
         res = self.lm_model(
             inputs_embeds=mm_embeds.unsqueeze(0),
-            labels=labels_with_mask
+            labels=targets["input_ids"],
+            attention_mask=targets["attention_mask"]
         )
 
         return res
 
     def projector_eval_mode(self):
+        # For evaluating/generating
         self.mm_model.model.model.eval()
         for parameter in self.mm_model.model.model.parameters():
             parameter.requires_grad = False
@@ -334,6 +370,7 @@ class CPMVQwenVLM(nn.Module):
         return
 
     def projector_training_mode(self):
+        # For training only the projector
         # Freeze multimodal model
         self.mm_model.model.model.eval()
         for parameter in self.mm_model.model.model.parameters():
@@ -360,8 +397,9 @@ class CPMVQwenVLM(nn.Module):
             test=None,
             testing=False
         ):
+        """Main training function
+        """
         log_frequency = 10 # How many training steps to be done between two train loss logs
-        # TEST FOR NORM OF TEXT EMBEDDING which dimensions ?
         if dataset is not None:
             train, test = load_dataset(dataset)
 
@@ -382,42 +420,54 @@ class CPMVQwenVLM(nn.Module):
         optimizer.zero_grad()
 
         log = []
-        train_step, eval_step, train_loss = 0, 0, torch.zeros(1)
-        for data_point in tqdm(train):
-            try:
-                caption = data_point["conversations"][1]["value"]
-                image = os.path.join(data_path, data_point["image"])
+        train_step, eval_step, train_loss = 0, 0, torch.zeros(batch_size)
+        
+        # Split the dataset into batches, data points represented by their indices -> to go thru sequentially
+        indices = random.shuffle([i for i in ragen(len(train))])
+        last_batch_size = len(train) % batch_size
+        
+        batches = [indices[curr_idx:curr_idx+batch_size] for curr_idx in range(len(train)//batch_size)]
+        if last_batch_size == 1:
+            batch_list += [indices[-1]]
+        else:
+            batch_list += [idx for idx in indices[len(train)-last_batch_len:]] # review that line
+        
+        # Training loop
+        for curr_epoch in range(epochs):
+          for training_step, curr_batch in tqdm(enumerate(batch_list), desc=f"Current epoch: {curr_epoch+1}"):
+              try:
+                  caption_list = [train[idx]["conversations"][1]["value"] for idx in curr_batch]
+                  image = [os.path.join(data_path, train[idx]["image"]) for idx in curr_batch]
 
-                result = self.forward(image=image, text=caption, target=caption)
-                loss = result["loss"]
-                train_loss += loss
+                  result = self.forward(image_list=image_lsit, text_list=caption_list, targets_list=caption_list)
+                  loss = result["loss"]
+                  train_loss += torch.sum(loss)/batch_size
 
-                if train_step % 10 == 0:
-                    # Revisit the logging
-                    log.append(f"Training step {train_step} loss: {(train_loss/10).tolist()[0]}")
-                    train_loss = torch.zeros(1)
+                  if training_step % 1000 == 0:
+                      self.projector.save(save_path)
+                      print(train_loss)
+                      # self.eval_projector(load_path=save_path, dataset=train, eval_step=eval_step)
 
-                if train_step % 1000 == 0:
-                    self.projector.save(save_path)
-                    print(train_loss)
-                    # self.eval_projector(load_path=save_path, dataset=train, eval_step=eval_step)
-                    # eval_step += 1
+                  if training_step % 10 == 0:
+                      # Revisit the logging
+                      log.append({"epoch": curr_epcoh, "training_step": training_step, "loss": train_loss/10})
+                      train_loss = torch.zeros(batch_size)
 
-                loss.backward()
-                optimizer.step()
+                  loss.backward()
+                  optimizer.step()
 
-            except:
-                traceback.print_exc()
-                self.projector.save(save_path) # Change to save the state with the training progress as well
-                print("projector saved!")
+              except:
+                  traceback.print_exc()
+                  self.projector.save(save_path) # Change to save the state with the training progress as well
+                  print("projector saved!")
 
-                with open("/data3/jmarie/JoliVision/test-checkpoint/training-log.txt", "w") as train_logger:
-                    json.dump(log, train_logger)
-                    print("training log successfully saved")
+                  with open("/data3/jmarie/JoliVision/test-checkpoint/training-log.txt", "w") as train_logger:
+                      json.dump(log, train_logger)
+                      print("training log successfully saved")
 
-                sys.exit(1)
+                  sys.exit(1)
 
-            train_step += 1
+              train_step += 1
 
         self.projector.save(save_path)
 
@@ -441,7 +491,7 @@ class CPMVQwenVLM(nn.Module):
         result_save_file: str=None,
         log_details: str=None
         ):
-        
+
         # In development
         if load_path is not None:
             self.projector.load_projector_checkpoint(load_path)
@@ -466,44 +516,19 @@ class CPMVQwenVLM(nn.Module):
         if save_results and result_save_file is None:
             with open("/data3/jmarie/JoliVision/training_log.txt") as test_logger:
                 train_logger.write(f"Eval step {eval_step} testing loss: {total_loss[0]/len(dataset)}\n")
-                
+
                 if log_details is not None:
                   train_logger.write(f"{log_details}\n")
 
             return
 
-def make_lm_batch(text_embeds: list[torch.Tensor],
-                  image_embeds: list[torch.Tensor],
-                  image_flags: list[int],
-                  image_embeds_len_list: list[int],
-                  padding_side: str=None
-                  ):
-    max_size = max([text_embed.shape[-1] + image_embed.shape[-1] for text_embed, image_embed in zip(text_embeds, image_embeds)])
-    max_size_idx = [i for i in range(len(text_embeds)) if text_embeds[i].shape[-1]+image_embeds.shape[-1] == max]
-    
-    pad_sizes = [torch.zeros(text_embed.shape[0], max_size-text_embed.shape[-1]-image_embed.shape[-1]) for idx, text_embed, image_embed in enumerate(zip(text_embeds, image_embeds)) if idx not in max_size_idx else torch.empty(image_embeds[0].shape[-1], 1)]
-
-    batch = []
-    for i, text_embed, image_embed in enumerate(zip(text_embeds, image_embeds)):
-        batch.append(torch.cat((padding_list[i], text_embed[:image_flags[i]], image_embed, text_embed[image_flags[i]+image_embeds_len_list[i]]), dim=-1))
-
-    if padding_side is None:
-        for idx in range()
-        # Default padding is right
-        return torch.stack([torch.cat((padding, text_embed[:image_flag], image_embed, text_embed[image_flag:, :]), dim=-1) for i, padding, text_embed[:, :image_flags]], dim=0)
-
-
-projector = CPMQwenProjector(cpm_dim=2304, qwen_dim=896).bfloat16()
-# print(cpm.model.model.__dict__.keys())
-# print(inspect.getmro(type(cpm.model.model)))
+projector = CPMQwenProjector(cpm_dim=2304, qwen_dim=896)
 vlm = CPMVQwenVLM(cpm, qwen, tokenizer, projector)
-# print(os.path.abspath(inspect.getfile(qwen.forward)))
 
 # Example
-
 print(vlm.generate(
-      "Describe the image I just gave you",
-      "/home/jmarie/flares/positive_img/0000.png"
+      ["Describe the image I just gave you"],
+      ["/home/jmarie/flares/positive_img/0000.png"]
     )
 )
 
@@ -514,36 +539,3 @@ vlm.eval_projector("/data3/jmarie/JoliVision/test-checkpoint/test.pt", save_resu
 
 # vlm_random = CPMVQwenVLM(cpm, qwen, tokenizer, CPMVQwenProjector(cpm_dim=2304, qwen_dim=896).bfloat16())
 # vlm_random.eval_projector()
-
-def stack_tensors_with_padding(tensors, padding_value=0, dim=0):
-    # Determine the maximum size in each dimension
-    max_sizes = [max(sizes) for sizes in zip(*[tensor.shape for tensor in tensors])]
-    
-    # Pad each tensor to match the maximum size
-    padded_tensors = []
-    for tensor in tensors:
-        pad_sizes = []
-        for i, size in enumerate(tensor.shape):
-            pad_before = 0
-            pad_after = max_sizes[i] - size
-            pad_sizes.append((pad_before, pad_after))
-        
-        # Flatten pad_sizes to match the required input format for torch.nn.functional.pad
-        pad_sizes = [p for pair in reversed(pad_sizes) for p in pair]
-        
-        # Pad the tensor
-        padded_tensor = torch.nn.functional.pad(tensor, pad_sizes, value=padding_value)
-        padded_tensors.append(padded_tensor)
-    
-    # Stack the padded tensors along the specified dimension
-    stacked_tensor = torch.stack(padded_tensors, dim=dim)
-    
-    return stacked_tensor
-
-# Example usage:
-tensor1 = torch.randn(2, 3)
-tensor2 = torch.randn(3, 2)
-tensor3 = torch.randn(1, 4)
-
-stacked_tensor = stack_tensors_with_padding([tensor1, tensor2, tensor3])
-print(stacked_tensor)
